@@ -2,6 +2,7 @@ config.h
 .DS_Store
 /.pio/
 /.vscode/
+.claude/
 *.bak
 *.tmp
 *.pdf

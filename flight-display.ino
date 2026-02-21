@@ -24,22 +24,31 @@
 #include "log.h"
 
 // FlightInfo is used across parsing, test overrides, and rendering.
-// Define it early so it's a complete type wherever needed.
+// Uses fixed char arrays to avoid heap allocation in hot paths.
 struct FlightInfo {
-  String ident;     // flight/callsign or registration/hex fallback
-  String typeCode;  // aircraft type (t)
-  String category;  // raw category code
-  long altitudeFt = -1;
-  double lat = NAN;
-  double lon = NAN;
-  double distanceKm = NAN;
-  String hex;  // transponder hex id
-  bool hasCallsign = false;
-  String opClass;  // MIL/COM/PVT
-  bool valid = false;
-  int seatOverride = -1;  // if >0, override seat display
+  char ident[16];      // flight/callsign or registration/hex fallback
+  char typeCode[8];    // aircraft type (t)
+  char category[4];    // raw ADS-B category code (A1-A7, B1-B7, C1-C3)
+  long altitudeFt;
+  double lat;
+  double lon;
+  double distanceKm;
+  char hex[8];         // transponder hex id
+  bool hasCallsign;
+  char opClass[4];     // MIL/COM/PVT
+  bool valid;
+  int seatOverride;    // if >0, override seat display
+  int dbFlags;         // adsb.lol dbFlags field; bit 0 = military
+
+  FlightInfo() : altitudeFt(-1), lat(NAN), lon(NAN), distanceKm(NAN),
+                 hasCallsign(false), valid(false), seatOverride(-1), dbFlags(-1) {
+    ident[0] = '\0';
+    typeCode[0] = '\0';
+    category[0] = '\0';
+    hex[0] = '\0';
+    opClass[0] = '\0';
+  }
 };
-// Local function prototypes used before definitions
 // Local function prototypes used before definitions
 static void relaysPowerOnly();
 static void showSplash(const char *msgTop, const char *msgBottom = nullptr);
@@ -135,15 +144,15 @@ static void relaysPowerOnly() {
   relayWrite(RELAY_MIL_PIN, false);
 }
 
-static void relaysShowCategory(const String &opClass) {
+static void relaysShowCategory(const char* opClass) {
   // Status ON, exactly one category ON
   relayWrite(RELAY_STATUS_PIN, true);
   relayWrite(RELAY_PVT_PIN, false);
   relayWrite(RELAY_COM_PIN, false);
   relayWrite(RELAY_MIL_PIN, false);
-  if (opClass == "PVT") relayWrite(RELAY_PVT_PIN, true);
-  else if (opClass == "COM") relayWrite(RELAY_COM_PIN, true);
-  else if (opClass == "MIL") relayWrite(RELAY_MIL_PIN, true);
+  if (strcmp(opClass, "PVT") == 0) relayWrite(RELAY_PVT_PIN, true);
+  else if (strcmp(opClass, "COM") == 0) relayWrite(RELAY_COM_PIN, true);
+  else if (strcmp(opClass, "MIL") == 0) relayWrite(RELAY_MIL_PIN, true);
 }
 
 #ifndef SCREEN_WIDTH
@@ -164,6 +173,15 @@ static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;  // 20s
 static const uint32_t FETCH_INTERVAL_MS = 30000;        // 30s between API calls
 static const uint32_t HTTP_CONNECT_TIMEOUT_MS = 15000;  // HTTP connect timeout
 static const uint32_t HTTP_READ_TIMEOUT_MS = 30000;     // HTTP read timeout
+
+// Exponential backoff with jitter for retry logic
+static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 60000) {
+  uint32_t exp = base << min((uint8_t)attempt, (uint8_t)5);
+  uint32_t jitter = (exp >> 3) * (esp_random() & 0x7) / 7;  // ~±12.5% jitter
+  return min(cap, exp + jitter);
+}
+static uint8_t g_fetchFailCount = 0;
+static uint32_t g_nextFetchAt = 0;
 // Wi‑Fi reconnect state
 static bool wifiConnecting = false;
 static bool wifiInitialized = false;
@@ -174,11 +192,12 @@ static bool g_otaReady = false;        // true after ArduinoOTA.begin while Wi�
 static volatile bool g_inOta = false;  // set during OTA to pause app work
 #endif
 
-// MIL cache
+// MIL cache — uses fixed char arrays to avoid heap allocation
 struct MilCacheEntry {
-  String hex;
+  char hex[8];    // ICAO hex is always 6 chars + null
   uint32_t ts;
   bool isMil;
+  bool valid;
 };
 static const size_t MIL_CACHE_SIZE = 16;
 static MilCacheEntry g_milCache[MIL_CACHE_SIZE];
@@ -215,9 +234,9 @@ static void httpHandleGetClosest() {
   bool alive = g_test.active && (int32_t)(millis() - g_test.expiresAt) < 0;
   doc["active"] = alive;
   doc["expires_in_ms"] = alive ? (int32_t)((int32_t)g_test.expiresAt - (int32_t)millis()) : 0;
-  doc["ident"] = g_test.fi.ident;
-  doc["op"] = g_test.fi.opClass;
-  doc["t"] = g_test.fi.typeCode;
+  doc["ident"] = (const char*)g_test.fi.ident;
+  doc["op"] = (const char*)g_test.fi.opClass;
+  doc["t"] = (const char*)g_test.fi.typeCode;
   doc["alt"] = g_test.fi.altitudeFt;
   doc["dist"] = g_test.fi.distanceKm;
   String out;
@@ -239,15 +258,21 @@ static void httpHandlePutClosest() {
   }
   FlightInfo fi;
   fi.valid = true;
-  fi.ident = doc["ident"].isNull() ? String("TEST") : String(doc["ident"].as<const char *>());
-  fi.typeCode = doc["t"].isNull() ? String("") : String(doc["t"].as<const char *>());
+  const char* identSrc = doc["ident"].isNull() ? "TEST" : doc["ident"].as<const char*>();
+  strncpy(fi.ident, identSrc, sizeof(fi.ident) - 1); fi.ident[sizeof(fi.ident) - 1] = '\0';
+  const char* tSrc = doc["t"].isNull() ? "" : doc["t"].as<const char*>();
+  strncpy(fi.typeCode, tSrc, sizeof(fi.typeCode) - 1); fi.typeCode[sizeof(fi.typeCode) - 1] = '\0';
   fi.altitudeFt = doc["alt"].isNull() ? -1 : doc["alt"].as<long>();
   fi.distanceKm = doc["dist"].isNull() ? NAN : doc["dist"].as<double>();
   fi.hasCallsign = true;
-  if (!doc["op"].isNull()) fi.opClass = String(doc["op"].as<const char *>());
+  if (!doc["op"].isNull()) {
+    strncpy(fi.opClass, doc["op"].as<const char*>(), sizeof(fi.opClass) - 1);
+    fi.opClass[sizeof(fi.opClass) - 1] = '\0';
+  }
   if (!doc["seats"].isNull()) fi.seatOverride = doc["seats"].as<int>();
-  if (fi.opClass.length() == 0) {
-    fi.opClass = (fi.seatOverride > 0 && fi.seatOverride <= 15) ? String("PVT") : String("COM");
+  if (fi.opClass[0] == '\0') {
+    strncpy(fi.opClass, (fi.seatOverride > 0 && fi.seatOverride <= 15) ? "PVT" : "COM", sizeof(fi.opClass) - 1);
+    fi.opClass[sizeof(fi.opClass) - 1] = '\0';
   }
   g_test.fi = fi;
   g_test.active = true;
@@ -280,14 +305,12 @@ static void httpStartOnce() {
   LOG_INFO("HTTP test server listening on :80");
 }
 #endif
-static bool milCacheLookup(const String &hex, bool &isMilOut) {
-  String key = hex;
-  key.trim();
-  key.toUpperCase();
+static bool milCacheLookup(const char* hex, bool &isMilOut) {
+  if (!hex || !*hex) return false;
   uint32_t now = millis();
   const uint32_t TTL = 6UL * 60UL * 60UL * 1000UL;  // 6 hours
   for (size_t i = 0; i < MIL_CACHE_SIZE; ++i) {
-    if (g_milCache[i].hex.length() && g_milCache[i].hex.equalsIgnoreCase(key)) {
+    if (g_milCache[i].valid && strcasecmp(g_milCache[i].hex, hex) == 0) {
       if ((now - g_milCache[i].ts) < TTL) {
         isMilOut = g_milCache[i].isMil;
         return true;
@@ -297,42 +320,35 @@ static bool milCacheLookup(const String &hex, bool &isMilOut) {
   return false;
 }
 
-static void milCacheStore(const String &hex, bool isMil) {
-  String key = hex;
-  key.trim();
-  key.toUpperCase();
+static void milCacheStore(const char* hex, bool isMil) {
+  if (!hex || !*hex) return;
   uint32_t now = millis();
   // Update existing
   for (size_t i = 0; i < MIL_CACHE_SIZE; ++i) {
-    if (g_milCache[i].hex.length() && g_milCache[i].hex.equalsIgnoreCase(key)) {
+    if (g_milCache[i].valid && strcasecmp(g_milCache[i].hex, hex) == 0) {
       g_milCache[i].isMil = isMil;
       g_milCache[i].ts = now;
       return;
     }
   }
   // Insert into first empty or oldest
-  size_t idx = MIL_CACHE_SIZE;
-  uint32_t oldest = UINT32_MAX;
+  size_t idx = 0;
+  uint32_t oldestAge = 0;
   for (size_t i = 0; i < MIL_CACHE_SIZE; ++i) {
-    if (g_milCache[i].hex.length() == 0) {
-      idx = i;
-      break;
-    }
+    if (!g_milCache[i].valid) { idx = i; break; }
     uint32_t age = now - g_milCache[i].ts;
-    if (age > oldest) {
-      oldest = age;
-      idx = i;
-    }
+    if (age > oldestAge) { oldestAge = age; idx = i; }
   }
-  if (idx >= MIL_CACHE_SIZE) idx = 0;
-  g_milCache[idx].hex = key;
+  strncpy(g_milCache[idx].hex, hex, sizeof(g_milCache[idx].hex) - 1);
+  g_milCache[idx].hex[sizeof(g_milCache[idx].hex) - 1] = '\0';
   g_milCache[idx].isMil = isMil;
   g_milCache[idx].ts = now;
+  g_milCache[idx].valid = true;
 }
 
-static bool fetchIsMilitaryByHex(const String &hex, bool &isMilOut) {
+static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
   isMilOut = false;
-  if (WiFi.status() != WL_CONNECTED || hex.length() == 0) return false;
+  if (WiFi.status() != WL_CONNECTED || !hex || !*hex) return false;
   String url = String(API_BASE);
   if (!url.startsWith("http")) url = String("https://") + url;
   url += "/v2/mil";
@@ -361,10 +377,18 @@ static bool fetchIsMilitaryByHex(const String &hex, bool &isMilOut) {
     return false;
   }
 
-  String lowerHex = String(hex);
-  lowerHex.toLowerCase();
-  String needle = String("\"hex\":\"") + lowerHex + "\"";
-  String carry;
+  // Build needle: "hex":"abcdef"
+  char needle[32];
+  {
+    char lowerHex[8];
+    strncpy(lowerHex, hex, sizeof(lowerHex) - 1);
+    lowerHex[sizeof(lowerHex) - 1] = '\0';
+    for (char* p = lowerHex; *p; ++p) *p = tolower(*p);
+    snprintf(needle, sizeof(needle), "\"hex\":\"%s\"", lowerHex);
+  }
+  size_t needleLen = strlen(needle);
+
+  char carry[32] = "";
   const size_t CHUNK = 1024;
   char buf[CHUNK + 1];
   unsigned long deadline = millis() + HTTP_READ_TIMEOUT_MS;
@@ -377,18 +401,21 @@ static bool fetchIsMilitaryByHex(const String &hex, bool &isMilOut) {
       if (!s.available()) break;
       else continue;
     }
-    deadline = millis() + HTTP_READ_TIMEOUT_MS;  // extend
+    deadline = millis() + HTTP_READ_TIMEOUT_MS;
     buf[n] = '\0';
-    String chunk = carry + String(buf);
-    chunk.toLowerCase();
-    if (chunk.indexOf(needle) >= 0) {
+    // Combine carry + current chunk for searching
+    // Simple approach: search in buf (lowered), check carry overlap
+    for (int j = 0; j < n; ++j) buf[j] = tolower(buf[j]);
+    if (strstr(buf, needle)) {
       isMilOut = true;
       http.end();
       return true;
     }
-    // keep tail overlap
-    if ((size_t)n >= needle.length()) carry = String(buf + n - needle.length());
-    else carry = String(buf, n);
+    // Keep tail overlap for cross-chunk matches
+    if ((size_t)n >= needleLen) {
+      memcpy(carry, buf + n - needleLen, needleLen);
+      carry[needleLen] = '\0';
+    }
   }
   http.end();
   return true;  // completed scan, not found => not mil
@@ -446,40 +473,49 @@ static void otaBeginOnce() {
 static bool g_haveDisplayed = false;
 static FlightInfo g_lastShown;
 
-static String classifyOp(const FlightInfo &fi) {
-  // 1) Military always wins regardless of size
-  if (FEATURE_MIL_LOOKUP && fi.hex.length()) {
-    bool isMil;
+static const char* classifyOp(const FlightInfo &fi) {
+  // 1) dbFlags bit 0 = military (from API, avoids blocking /v2/mil call)
+  if (fi.dbFlags >= 0 && (fi.dbFlags & 1)) return "MIL";
+
+  // 2) MIL cache / live lookup as fallback
+  if (FEATURE_MIL_LOOKUP && fi.hex[0]) {
+    bool isMil = false;
     if (milCacheLookup(fi.hex, isMil)) {
-      if (isMil) return String("MIL");
+      if (isMil) return "MIL";
     } else {
       bool ok = fetchIsMilitaryByHex(fi.hex, isMil);
       if (ok) milCacheStore(fi.hex, isMil);
-      if (isMil) return String("MIL");
+      if (isMil) return "MIL";
     }
   }
 
-  // 2) Seat-based override: small aircraft (<= 15 seats) are PVT for this device.
-  if (fi.typeCode.length()) {
+  // 3) Seat-based: small aircraft (<= 15 seats) are PVT
+  if (fi.typeCode[0]) {
     uint16_t maxSeats = 0;
     if (aircraftSeatMax(fi.typeCode, maxSeats)) {
-      if (maxSeats > 0 && maxSeats <= 15) {
-        return String("PVT");
-      }
+      if (maxSeats > 0 && maxSeats <= 15) return "PVT";
     }
   }
 
-  // 3) Default: COM if it carries a callsign, else PVT
-  return fi.hasCallsign ? String("COM") : String("PVT");
+  // 4) ADS-B category as supplementary signal when type is unknown
+  if (fi.category[0] && !fi.typeCode[0]) {
+    // A1=Light, A7=Rotorcraft → likely private
+    if (strcmp(fi.category, "A1") == 0 || strcmp(fi.category, "A7") == 0) return "PVT";
+    // A3=Large, A4=High vortex, A5=Heavy → likely commercial
+    if (strcmp(fi.category, "A3") == 0 || strcmp(fi.category, "A4") == 0 || strcmp(fi.category, "A5") == 0) return "COM";
+  }
+
+  // 5) Default: COM if it carries a callsign, else PVT
+  return fi.hasCallsign ? "COM" : "PVT";
 }
 
 static bool sameFlightDisplay(const FlightInfo &a, const FlightInfo &b) {
   if (!a.valid && !b.valid) return true;
   if (a.valid != b.valid) return false;
-  if (a.ident != b.ident) return false;
-  if (a.typeCode != b.typeCode) return false;
+  if (strcmp(a.ident, b.ident) != 0) return false;
+  if (strcmp(a.typeCode, b.typeCode) != 0) return false;
   if (a.altitudeFt != b.altitudeFt) return false;
-  if (a.opClass != b.opClass) return false;
+  if (strcmp(a.opClass, b.opClass) != 0) return false;
   // Consider distances equal within 0.1 km to avoid flicker
   double da = isnan(a.distanceKm) ? 0 : a.distanceKm;
   double db = isnan(b.distanceKm) ? 0 : b.distanceKm;
@@ -597,30 +633,45 @@ static FlightInfo parseClosest(JsonVariant root) {
   if (!extractLatLon(obj, lat, lon)) return res;
 
   // Build ident preference chain: flight -> r -> hex
-  String ident;
+  const char* identSrc = nullptr;
   bool hasCallsign = false;
   if (obj["flight"]) {
-    ident = String(obj["flight"].as<const char *>());
-    hasCallsign = ident.length() > 0;
-  } else if (obj["r"]) ident = String(obj["r"].as<const char *>());
-  else if (obj["hex"]) ident = String(obj["hex"].as<const char *>());
-  else ident = String("(unknown)");
-  ident.trim();
+    identSrc = obj["flight"].as<const char*>();
+    hasCallsign = (identSrc && *identSrc);
+  }
+  if (!identSrc || !*identSrc) {
+    if (obj["r"]) identSrc = obj["r"].as<const char*>();
+  }
+  if (!identSrc || !*identSrc) {
+    if (obj["hex"]) identSrc = obj["hex"].as<const char*>();
+  }
+  if (!identSrc || !*identSrc) identSrc = "(unknown)";
 
-  long alt = obj["alt_baro"].isNull() ? -1 : obj["alt_baro"].as<long>();
-  String type = obj["t"].isNull() ? String("") : String(obj["t"].as<const char *>());
-  if (!obj["t"] && obj["type"]) type = String(obj["type"].as<const char *>());
-  String cat = obj["category"].isNull() ? String("") : String(obj["category"].as<const char *>());
+  // Copy and trim ident
+  strncpy(res.ident, identSrc, sizeof(res.ident) - 1);
+  res.ident[sizeof(res.ident) - 1] = '\0';
+  // Trim trailing whitespace
+  for (int i = strlen(res.ident) - 1; i >= 0 && res.ident[i] == ' '; --i) res.ident[i] = '\0';
+
+  res.altitudeFt = obj["alt_baro"].isNull() ? -1 : obj["alt_baro"].as<long>();
+
+  const char* typeSrc = obj["t"].isNull() ? nullptr : obj["t"].as<const char*>();
+  if (!typeSrc && !obj["type"].isNull()) typeSrc = obj["type"].as<const char*>();
+  if (typeSrc) { strncpy(res.typeCode, typeSrc, sizeof(res.typeCode) - 1); res.typeCode[sizeof(res.typeCode) - 1] = '\0'; }
+
+  const char* catSrc = obj["category"].isNull() ? nullptr : obj["category"].as<const char*>();
+  if (catSrc) { strncpy(res.category, catSrc, sizeof(res.category) - 1); res.category[sizeof(res.category) - 1] = '\0'; }
+
+  const char* hexSrc = obj["hex"].isNull() ? nullptr : obj["hex"].as<const char*>();
+  if (hexSrc) { strncpy(res.hex, hexSrc, sizeof(res.hex) - 1); res.hex[sizeof(res.hex) - 1] = '\0'; }
+
+  // dbFlags: bit 0 = military
+  res.dbFlags = obj["dbFlags"].isNull() ? -1 : obj["dbFlags"].as<int>();
 
   res.valid = true;
-  res.ident = ident;
-  res.typeCode = type;
-  res.category = cat;
-  res.altitudeFt = alt;
   res.lat = lat;
   res.lon = lon;
-  res.distanceKm = haversineKm(HOME_LAT, HOME_LON, lat, lon);  // 2D ground distance for display only
-  res.hex = obj["hex"].isNull() ? String("") : String(obj["hex"].as<const char *>());
+  res.distanceKm = haversineKm(HOME_LAT, HOME_LON, lat, lon);
   res.hasCallsign = hasCallsign;
   return res;
 }
@@ -694,10 +745,11 @@ static bool fetchNearestFlight(FlightInfo &out) {
   acObj["alt_baro"] = true;
   acObj["lat"] = true;
   acObj["lon"] = true;
-  // closest endpoint returns only one aircraft, but keep minimal fields
   acObj["seen_pos"] = true;
+  acObj["category"] = true;
+  acObj["dbFlags"] = true;  // bit 0 = military
 
-  DynamicJsonDocument doc(8192);  // ~8KB; filtered and single-aircraft
+  StaticJsonDocument<2048> doc;  // stack-allocated; filtered single-aircraft response is well under 1KB
   // Prefer streamed parsing to minimize RAM and fragmentation
   DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();
@@ -708,10 +760,12 @@ static bool fetchNearestFlight(FlightInfo &out) {
 
   FlightInfo closest = parseClosest(doc.as<JsonVariant>());
   if (closest.valid) {
-    LOG_INFO("Closest %s  dist %.2f km", closest.ident.c_str(), closest.distanceKm);
+    LOG_INFO("Closest %s  dist %.2f km", closest.ident, closest.distanceKm);
     // Classify operation (MIL/COM/PVT)
-    closest.opClass = classifyOp(closest);
-    LOG_INFO("Classified op: %s", closest.opClass.c_str());
+    const char* op = classifyOp(closest);
+    strncpy(closest.opClass, op, sizeof(closest.opClass) - 1);
+    closest.opClass[sizeof(closest.opClass) - 1] = '\0';
+    LOG_INFO("Classified op: %s", closest.opClass);
     out = closest;
     return true;
   }
@@ -726,28 +780,30 @@ static void renderFlight(const FlightInfo &fi) {
   u8g2.setDrawColor(1);
 
   // 1) Top line: friendly aircraft name, allow pseudo/unknown fallbacks
-  String friendly = fi.typeCode.length() ? aircraftFriendlyName(fi.typeCode) : String("");
-  // Detect pseudo/non-aircraft types to avoid showing raw codes
+  char friendlyBuf[64];
   bool isPseudo = false;
-  String codeUC = fi.typeCode;
-  codeUC.trim();
-  codeUC.toUpperCase();
-  if (!friendly.length() && codeUC.length()) {
-    if (codeUC.startsWith("TISB")) {
-      friendly = "TIS-B Target";
-      isPseudo = true;
-    } else if (codeUC.startsWith("ADSB")) {
-      friendly = "ADS-B Target";
-      isPseudo = true;
-    } else if (codeUC.startsWith("MLAT")) {
-      friendly = "MLAT Target";
-      isPseudo = true;
-    } else if (codeUC.startsWith("MODE")) {
-      friendly = "Mode-S Target";
-      isPseudo = true;
+  bool hasFriendly = false;
+  if (fi.typeCode[0]) {
+    hasFriendly = aircraftFriendlyNameBuf(fi.typeCode, friendlyBuf, sizeof(friendlyBuf));
+  }
+  if (!hasFriendly && fi.typeCode[0]) {
+    // Detect pseudo/non-aircraft types
+    if (strncasecmp(fi.typeCode, "TISB", 4) == 0) {
+      strncpy(friendlyBuf, "TIS-B Target", sizeof(friendlyBuf));
+      isPseudo = true; hasFriendly = true;
+    } else if (strncasecmp(fi.typeCode, "ADSB", 4) == 0) {
+      strncpy(friendlyBuf, "ADS-B Target", sizeof(friendlyBuf));
+      isPseudo = true; hasFriendly = true;
+    } else if (strncasecmp(fi.typeCode, "MLAT", 4) == 0) {
+      strncpy(friendlyBuf, "MLAT Target", sizeof(friendlyBuf));
+      isPseudo = true; hasFriendly = true;
+    } else if (strncasecmp(fi.typeCode, "MODE", 4) == 0) {
+      strncpy(friendlyBuf, "Mode-S Target", sizeof(friendlyBuf));
+      isPseudo = true; hasFriendly = true;
     }
   }
-  if (!friendly.length()) friendly = String("Unknown Aircraft");
+  if (!hasFriendly) strncpy(friendlyBuf, "Unknown Aircraft", sizeof(friendlyBuf));
+  String friendly = String(friendlyBuf);
 
   // Bottom metrics font (~50% larger than before)
   const uint8_t *bottomFont = u8g2_font_9x18_tf;  // was 6x12
@@ -839,26 +895,26 @@ static void renderFlight(const FlightInfo &fi) {
   int16_t descent = u8g2.getDescent();
   int16_t yBottom = SCREEN_HEIGHT - 1 - (descent < 0 ? -descent : descent);
 
-  String distStr = String("—");
-  if (!isnan(fi.distanceKm)) distStr = String(fi.distanceKm, 1) + "km";
+  char distStr[16] = "\xE2\x80\x94";  // em-dash
+  if (!isnan(fi.distanceKm)) snprintf(distStr, sizeof(distStr), "%.1fkm", fi.distanceKm);
 
-  uint16_t maxSeats = 0;
-  String seatsStr = String("—");
+  char seatsStr[8] = "\xE2\x80\x94";  // em-dash
   if (!isPseudo) {
-    if (fi.seatOverride > 0) seatsStr = String(fi.seatOverride);
-    else if (fi.typeCode.length() && aircraftSeatMax(fi.typeCode, maxSeats) && maxSeats > 0) seatsStr = String(maxSeats);
+    uint16_t maxSeats = 0;
+    if (fi.seatOverride > 0) snprintf(seatsStr, sizeof(seatsStr), "%d", fi.seatOverride);
+    else if (fi.typeCode[0] && aircraftSeatMax(fi.typeCode, maxSeats) && maxSeats > 0) snprintf(seatsStr, sizeof(seatsStr), "%u", (unsigned)maxSeats);
   }
 
-  String altStr = String("—");
-  if (fi.altitudeFt >= 0) altStr = String(fi.altitudeFt) + "ft";
+  char altStr[16] = "\xE2\x80\x94";  // em-dash
+  if (fi.altitudeFt >= 0) snprintf(altStr, sizeof(altStr), "%ldft", fi.altitudeFt);
 
   const int cells = 3;
   const int cellW = SCREEN_WIDTH / cells;
-  auto drawCenteredInCell = [&](int idx, const String &text) {
-    uint16_t bw = u8g2.getUTF8Width(text.c_str());
+  auto drawCenteredInCell = [&](int idx, const char* text) {
+    uint16_t bw = u8g2.getUTF8Width(text);
     int16_t cx = idx * cellW + (cellW - (int)bw) / 2;
     if (cx < 0) cx = 0;
-    u8g2.drawUTF8(cx, yBottom, text.c_str());
+    u8g2.drawUTF8(cx, yBottom, text);
   };
 
   drawCenteredInCell(0, distStr);
@@ -869,8 +925,6 @@ static void renderFlight(const FlightInfo &fi) {
 }
 
 void setup() {
-  // Initialize all unique relay role pins to inactive (OFF)
-  const int INACTIVE = (RELAY_ACTIVE_HIGH ? LOW : HIGH);
   // Simple, explicit relay init and boot state
   relaysInit();
 
@@ -952,8 +1006,6 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastFetch = 0;
-
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
@@ -991,10 +1043,12 @@ void loop() {
   }
 #endif
 
-  if (millis() - lastFetch >= FETCH_INTERVAL_MS || lastFetch == 0) {
-    lastFetch = millis();
+  uint32_t now = millis();
+  if (now >= g_nextFetchAt || g_nextFetchAt == 0) {
     FlightInfo nearest;
     if (fetchNearestFlight(nearest)) {
+      g_fetchFailCount = 0;
+      g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
       if (!g_haveDisplayed || !sameFlightDisplay(nearest, g_lastShown)) {
         renderFlight(nearest);
         g_lastShown = nearest;
@@ -1002,6 +1056,9 @@ void loop() {
         relaysShowCategory(g_lastShown.opClass);
       }
     } else {
+      g_fetchFailCount = min((uint8_t)(g_fetchFailCount + 1), (uint8_t)8);
+      g_nextFetchAt = millis() + backoffMs(g_fetchFailCount);
+      LOG_WARN("Fetch failed (attempt %d), next retry in %lu ms", g_fetchFailCount, backoffMs(g_fetchFailCount));
       if (!g_haveDisplayed) {
         showSplash("No data", "Check Wi-Fi/API");
       }

@@ -38,9 +38,9 @@ This guide defines how an AI coding agent should propose, write, and review firm
 ## 3) Target Profile & Budgets
 
 - **Board:** ESP32-WROOM-32 (no PSRAM assumed).
-- **Display:** SSD1306/SH1106-class OLED (typical 128×64) or larger (e.g., 256×64) via SPI or I²C.  
-  - **I²C address:** usually `0x3C` (fallback `0x3D`).  
-  - **Frame budget:** aim ≤ 15 ms/update (≈66 FPS max; typical ≤ 20 FPS).  
+- **Display:** SSD1322 OLED (256×64) via SPI (NHD-5.5-25664UCG3). Driver: U8g2 full framebuffer.
+  - **SPI pins:** CS=5, DC=16, RST=17, SCLK=18, MOSI=23.
+  - **Frame budget:** aim ≤ 15 ms/update (≈66 FPS max; typical ≤ 20 FPS).
   - **Redraw strategy:** partial/incremental when possible; avoid full-screen clears each frame.
 - **Networking:** Wi-Fi STA, TLS optional; memory pressure increases with HTTPS.
 - **Timing goals:** No single task in `loop()` > 5 ms. Aggregate work slice < 10 ms typical.
@@ -177,45 +177,30 @@ When proposing a new module or feature, follow this exact order in your reply:
 
 ## 11) Example: Display Init (Assumption-aware)
 
+> **Note:** This example uses SSD1306/Adafruit for illustration. The actual project uses
+> **U8g2 with SSD1322** via HW SPI. See `flight-display.ino` for the real init code.
+
 ```cpp
 /*
-  Target: ESP32-WROOM-32, Adafruit_SSD1306 v2.5.9, Wire at 400kHz
-  ASSUMPTION: OLED = SSD1306 128x64 at I2C 0x3C; SCL=22, SDA=21
-  HOW TO VERIFY: If init fails, run I2C scanner; try 0x3D; confirm wiring.
-  FOOTPRINT: +~26 KB flash (driver), ~1 KB static, ~1 KB heap at idle (excluding framebuffer)
+  Target: ESP32-WROOM-32, U8g2lib, HW SPI
+  ACTUAL: SSD1322 256x64 via SPI (CS=5, DC=16, RST=17, SCLK=18, MOSI=23)
+  FOOTPRINT: +~26 KB flash (driver), ~2 KB static, framebuffer ~2 KB
 */
 
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+#include "config.h"
 #include "log.h"
 
-constexpr uint8_t I2C_SDA_PIN = 21;
-constexpr uint8_t I2C_SCL_PIN = 22;
-constexpr uint8_t OLED_ADDR   = 0x3C;
-constexpr int     OLED_W      = 128;
-constexpr int     OLED_H      = 64;
+U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI u8g2(U8G2_R2, PIN_CS, PIN_DC, PIN_RST);
 
-Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
-
-bool initDisplay() {
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(400000);
-  for (uint8_t attempt = 0; attempt < 4; ++attempt) {
-    if (display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-      display.clearDisplay();
-      display.setTextSize(1);
-      display.setTextColor(SSD1306_WHITE);
-      display.setCursor(0,0);
-      display.println(F("OLED OK"));
-      display.display();
-      LOG_INFO("OLED ready at 0x%02X", OLED_ADDR);
-      return true;
-    }
-    delay(backoffMs(attempt)); // start-up only
-  }
-  LOG_ERROR("OLED init failed; check address/wiring.");
-  return false;
+void initDisplay() {
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x12_tf);
+  u8g2.drawStr(0, 12, "OLED OK");
+  u8g2.sendBuffer();
+  LOG_INFO("SSD1322 display ready (256x64 SPI)");
 }
 ```
 

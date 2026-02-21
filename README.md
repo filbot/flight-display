@@ -30,13 +30,8 @@ If relays don’t match the expected channel (e.g., COM lights the wrong relay o
 - Map roles explicitly by overriding in `config.h`:
   - `RELAY_STATUS_PIN`, `RELAY_COM_PIN`, `RELAY_PVT_PIN`, `RELAY_MIL_PIN`
 - Optionally disable the dedicated status channel: `#define RELAY_USE_STATUS_CHANNEL 0`.
-- Use the built‑in test endpoint to validate wiring per channel:
-  - `GET http://<device-ip>/test/relay?name=status&on=1`
-  - `GET http://<device-ip>/test/relay?name=com&on=1`
-  - `GET http://<device-ip>/test/relay?name=pvt&on=1`
-  - `GET http://<device-ip>/test/relay?name=mil&on=1`
-  - Or by GPIO: `GET /test/relay?pin=25&on=1`
-Turn channels off with `on=0`.
+- Use the test endpoint to push test flight data with specific `op` class to validate relay wiring:
+  - `PUT http://<device-ip>/test/closest` with body `{"ident":"TEST","op":"COM"}` (repeat for PVT, MIL)
 
 ## Libraries
 
@@ -60,7 +55,7 @@ GET /v2/closest/{lat}/{lon}/{radius}
 - **radius**: Search radius in kilometers (**integer**)  
 
 Example:
-https://api.adsb.lol/v2/closest/47.6000/-122.3300/32
+https://api.adsb.lol/v2/closest/40.6413/-73.7781/32
 
 Returns the closest aircraft object with fields like:
 ```json
@@ -72,8 +67,8 @@ Returns the closest aircraft object with fields like:
   "category": "A3",
   "alt_baro": 35000,
   "gs": 445,
-  "lat": 47.621,
-  "lon": -122.350
+  "lat": 40.645,
+  "lon": -73.782
 }
 
 ### Optional MIL classification
