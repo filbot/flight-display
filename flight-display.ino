@@ -655,8 +655,9 @@ static FlightInfo parseClosest(JsonVariant root) {
 
   res.altitudeFt = obj["alt_baro"].isNull() ? -1 : obj["alt_baro"].as<long>();
 
+  // "t" = aircraft type designator (B738, A320, etc.)
+  // Note: "type" is a different field (message type: adsb_icao, tisb, mlat) — do NOT use as fallback
   const char* typeSrc = obj["t"].isNull() ? nullptr : obj["t"].as<const char*>();
-  if (!typeSrc && !obj["type"].isNull()) typeSrc = obj["type"].as<const char*>();
   if (typeSrc) { strncpy(res.typeCode, typeSrc, sizeof(res.typeCode) - 1); res.typeCode[sizeof(res.typeCode) - 1] = '\0'; }
 
   const char* catSrc = obj["category"].isNull() ? nullptr : obj["category"].as<const char*>();
@@ -741,7 +742,6 @@ static bool fetchNearestFlight(FlightInfo &out) {
   acObj["r"] = true;
   acObj["hex"] = true;
   acObj["t"] = true;
-  acObj["type"] = true;
   acObj["alt_baro"] = true;
   acObj["lat"] = true;
   acObj["lon"] = true;
