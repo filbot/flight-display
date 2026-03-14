@@ -13,7 +13,7 @@
 #define LOG_ERROR(...) \
   do { \
     if (LOG_LEVEL >= 0) { \
-      Serial.printf("[E][%s] ", LOG_TAG); \
+      Serial.printf("[E][%s][%lu] ", LOG_TAG, (unsigned long)millis()); \
       Serial.printf(__VA_ARGS__); \
       Serial.println(); \
     } \
@@ -21,7 +21,7 @@
 #define LOG_WARN(...) \
   do { \
     if (LOG_LEVEL >= 1) { \
-      Serial.printf("[W][%s] ", LOG_TAG); \
+      Serial.printf("[W][%s][%lu] ", LOG_TAG, (unsigned long)millis()); \
       Serial.printf(__VA_ARGS__); \
       Serial.println(); \
     } \
@@ -29,7 +29,7 @@
 #define LOG_INFO(...) \
   do { \
     if (LOG_LEVEL >= 2) { \
-      Serial.printf("[I][%s] ", LOG_TAG); \
+      Serial.printf("[I][%s][%lu] ", LOG_TAG, (unsigned long)millis()); \
       Serial.printf(__VA_ARGS__); \
       Serial.println(); \
     } \
@@ -37,7 +37,7 @@
 #define LOG_DEBUG(...) \
   do { \
     if (LOG_LEVEL >= 3) { \
-      Serial.printf("[D][%s] ", LOG_TAG); \
+      Serial.printf("[D][%s][%lu] ", LOG_TAG, (unsigned long)millis()); \
       Serial.printf(__VA_ARGS__); \
       Serial.println(); \
     } \

@@ -29,7 +29,7 @@ struct FlightInfo {
   char ident[16];      // flight/callsign or registration/hex fallback
   char typeCode[8];    // aircraft type (t)
   char category[4];    // raw ADS-B category code (A1-A7, B1-B7, C1-C3)
-  long altitudeFt;
+  int32_t altitudeFt;
   double lat;
   double lon;
   double distanceKm;
@@ -37,8 +37,8 @@ struct FlightInfo {
   bool hasCallsign;
   char opClass[4];     // MIL/COM/PVT
   bool valid;
-  int seatOverride;    // if >0, override seat display
-  int dbFlags;         // adsb.lol dbFlags field; bit 0 = military
+  int16_t seatOverride;    // if >0, override seat display
+  int16_t dbFlags;         // adsb.lol dbFlags field; bit 0 = military
 
   FlightInfo() : altitudeFt(-1), lat(NAN), lon(NAN), distanceKm(NAN),
                  hasCallsign(false), valid(false), seatOverride(-1), dbFlags(-1) {
@@ -52,7 +52,7 @@ struct FlightInfo {
 // Local function prototypes used before definitions
 static void relaysPowerOnly();
 static void showSplash(const char *msgTop, const char *msgBottom = nullptr);
-static void drawCentered(const String &text, int16_t baselineY);
+static void drawCentered(const char *text, int16_t baselineY);
 
 // -----------------------------
 // OTA configuration (overridable in config.h)
@@ -169,10 +169,24 @@ static void relaysShowCategory(const char* opClass) {
 // SPI OLED (SSD1322) via U8g2, full framebuffer, HW SPI (rotated 180°)
 U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI u8g2(U8G2_R2, PIN_CS, PIN_DC, PIN_RST);
 
-static const uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;  // 20s
-static const uint32_t FETCH_INTERVAL_MS = 30000;        // 30s between API calls
-static const uint32_t HTTP_CONNECT_TIMEOUT_MS = 15000;  // HTTP connect timeout
-static const uint32_t HTTP_READ_TIMEOUT_MS = 30000;     // HTTP read timeout
+static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;  // 20s
+static constexpr uint32_t FETCH_INTERVAL_MS = 30000;        // 30s between API calls
+static constexpr uint32_t HTTP_CONNECT_TIMEOUT_MS = 15000;  // HTTP connect timeout
+static constexpr uint32_t HTTP_READ_TIMEOUT_MS = 30000;     // HTTP read timeout
+static constexpr uint32_t MIL_LOOKUP_HARD_TIMEOUT_MS = 15000;  // absolute wall-clock limit for /v2/mil streaming
+
+// Heap monitoring thresholds
+#ifndef HEAP_WARN_THRESHOLD
+#define HEAP_WARN_THRESHOLD 30000
+#endif
+#ifndef HEAP_CRITICAL_THRESHOLD
+#define HEAP_CRITICAL_THRESHOLD 15000
+#endif
+
+// Circuit breaker: restart after sustained API failures
+#ifndef FETCH_FAIL_RESTART_THRESHOLD
+#define FETCH_FAIL_RESTART_THRESHOLD 60  // ~30 min at max backoff
+#endif
 
 // Exponential backoff with jitter for retry logic
 static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 60000) {
@@ -182,10 +196,27 @@ static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 
 }
 static uint8_t g_fetchFailCount = 0;
 static uint32_t g_nextFetchAt = 0;
+
+static void checkHeap() {
+#if defined(ESP32)
+  uint32_t freeHeap = ESP.getFreeHeap();
+  if (freeHeap < HEAP_CRITICAL_THRESHOLD) {
+    LOG_ERROR("CRITICAL: Free heap %u < %u, restarting", freeHeap, (uint32_t)HEAP_CRITICAL_THRESHOLD);
+    ESP.restart();
+  }
+  if (freeHeap < HEAP_WARN_THRESHOLD) {
+    LOG_WARN("Low heap: %u bytes free", freeHeap);
+  }
+#endif
+}
 // Wi‑Fi reconnect state
 static bool wifiConnecting = false;
 static bool wifiInitialized = false;
 static bool wifiEverBegun = false;
+static uint32_t wifiLastAttemptAt = 0;
+#ifndef WIFI_RETRY_INTERVAL_MS
+#define WIFI_RETRY_INTERVAL_MS 60000  // retry WiFi.begin() every 60s if disconnected
+#endif
 
 #if FEATURE_OTA
 static bool g_otaReady = false;        // true after ArduinoOTA.begin while Wi‑Fi has IP
@@ -193,14 +224,17 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 #endif
 
 // MIL cache — uses fixed char arrays to avoid heap allocation
+static constexpr uint32_t MIL_CACHE_TTL_POS = 6UL * 60UL * 60UL * 1000UL;  // 6h for confirmed results
+static constexpr uint32_t MIL_CACHE_TTL_NEG = 1UL * 60UL * 60UL * 1000UL;  // 1h for negative/failure results
 struct MilCacheEntry {
   char hex[8];    // ICAO hex is always 6 chars + null
   uint32_t ts;
+  uint32_t ttl;   // per-entry TTL (positive vs negative cache)
   bool isMil;
   bool valid;
 };
-static const size_t MIL_CACHE_SIZE = 16;
-static MilCacheEntry g_milCache[MIL_CACHE_SIZE];
+static constexpr size_t MIL_CACHE_SIZE = 16;
+static MilCacheEntry g_milCache[MIL_CACHE_SIZE];  // BSS zero-init; .valid=false gates access
 
 // Flight info structure used across network parsing, test overrides, and rendering
 // (struct FlightInfo defined earlier)
@@ -262,7 +296,7 @@ static void httpHandlePutClosest() {
   strncpy(fi.ident, identSrc, sizeof(fi.ident) - 1); fi.ident[sizeof(fi.ident) - 1] = '\0';
   const char* tSrc = doc["t"].isNull() ? "" : doc["t"].as<const char*>();
   strncpy(fi.typeCode, tSrc, sizeof(fi.typeCode) - 1); fi.typeCode[sizeof(fi.typeCode) - 1] = '\0';
-  fi.altitudeFt = doc["alt"].isNull() ? -1 : doc["alt"].as<long>();
+  fi.altitudeFt = doc["alt"].isNull() ? -1 : doc["alt"].as<int32_t>();
   fi.distanceKm = doc["dist"].isNull() ? NAN : doc["dist"].as<double>();
   fi.hasCallsign = true;
   if (!doc["op"].isNull()) {
@@ -308,10 +342,10 @@ static void httpStartOnce() {
 static bool milCacheLookup(const char* hex, bool &isMilOut) {
   if (!hex || !*hex) return false;
   uint32_t now = millis();
-  const uint32_t TTL = 6UL * 60UL * 60UL * 1000UL;  // 6 hours
   for (size_t i = 0; i < MIL_CACHE_SIZE; ++i) {
     if (g_milCache[i].valid && strcasecmp(g_milCache[i].hex, hex) == 0) {
-      if ((now - g_milCache[i].ts) < TTL) {
+      // Rollover-safe: unsigned subtraction wraps correctly for intervals < 2^31
+      if ((now - g_milCache[i].ts) < g_milCache[i].ttl) {
         isMilOut = g_milCache[i].isMil;
         return true;
       }
@@ -320,7 +354,7 @@ static bool milCacheLookup(const char* hex, bool &isMilOut) {
   return false;
 }
 
-static void milCacheStore(const char* hex, bool isMil) {
+static void milCacheStore(const char* hex, bool isMil, uint32_t ttl = MIL_CACHE_TTL_POS) {
   if (!hex || !*hex) return;
   uint32_t now = millis();
   // Update existing
@@ -328,6 +362,7 @@ static void milCacheStore(const char* hex, bool isMil) {
     if (g_milCache[i].valid && strcasecmp(g_milCache[i].hex, hex) == 0) {
       g_milCache[i].isMil = isMil;
       g_milCache[i].ts = now;
+      g_milCache[i].ttl = ttl;
       return;
     }
   }
@@ -343,16 +378,16 @@ static void milCacheStore(const char* hex, bool isMil) {
   g_milCache[idx].hex[sizeof(g_milCache[idx].hex) - 1] = '\0';
   g_milCache[idx].isMil = isMil;
   g_milCache[idx].ts = now;
+  g_milCache[idx].ttl = ttl;
   g_milCache[idx].valid = true;
 }
 
 static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
   isMilOut = false;
   if (WiFi.status() != WL_CONNECTED || !hex || !*hex) return false;
-  String url = String(API_BASE);
-  if (!url.startsWith("http")) url = String("https://") + url;
-  url += "/v2/mil";
-  LOG_INFO("HTTP GET %s", url.c_str());
+  char url[128];
+  snprintf(url, sizeof(url), "%s/v2/mil", API_BASE);
+  LOG_INFO("HTTP GET %s", url);
 
   HTTPClient http;
   http.setReuse(false);
@@ -388,34 +423,44 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
   }
   size_t needleLen = strlen(needle);
 
-  char carry[32] = "";
+  // Overlap buffer holds the tail of the previous chunk so that a needle
+  // spanning a chunk boundary is not missed.
+  char overlap[32] = "";
+  size_t overlapLen = 0;
   const size_t CHUNK = 1024;
-  char buf[CHUNK + 1];
-  unsigned long deadline = millis() + HTTP_READ_TIMEOUT_MS;
+  // Search buffer: overlap region + new chunk (allows cross-boundary matching)
+  char searchBuf[32 + CHUNK + 1];
+  char readBuf[CHUNK + 1];
+  // Absolute wall-clock timeout — never resets per chunk (rollover-safe subtraction)
+  uint32_t startTime = millis();
   Stream &s = http.getStream();
-  while (millis() < deadline) {
-    int n = s.readBytes(buf, CHUNK);
+  while ((millis() - startTime) < MIL_LOOKUP_HARD_TIMEOUT_MS) {
+    int n = s.readBytes(readBuf, CHUNK);
     if (n <= 0) {
-      delay(10);
-      yield();
+      yield();  // cooperative yield, no blocking delay()
       if (!s.available()) break;
-      else continue;
+      continue;
     }
-    deadline = millis() + HTTP_READ_TIMEOUT_MS;
-    buf[n] = '\0';
-    // Combine carry + current chunk for searching
-    // Simple approach: search in buf (lowered), check carry overlap
-    for (int j = 0; j < n; ++j) buf[j] = tolower(buf[j]);
-    if (strstr(buf, needle)) {
+    // Lowercase the new data for case-insensitive matching
+    for (int j = 0; j < n; ++j) readBuf[j] = tolower(readBuf[j]);
+    readBuf[n] = '\0';
+    // Concatenate overlap + new chunk into searchBuf for cross-boundary matches
+    memcpy(searchBuf, overlap, overlapLen);
+    memcpy(searchBuf + overlapLen, readBuf, n + 1);  // includes '\0'
+    if (strstr(searchBuf, needle)) {
       isMilOut = true;
       http.end();
       return true;
     }
-    // Keep tail overlap for cross-chunk matches
+    // Keep tail of new chunk as overlap for next iteration
     if ((size_t)n >= needleLen) {
-      memcpy(carry, buf + n - needleLen, needleLen);
-      carry[needleLen] = '\0';
+      overlapLen = needleLen - 1;
+      memcpy(overlap, readBuf + n - overlapLen, overlapLen);
+    } else {
+      overlapLen = (size_t)n;
+      memcpy(overlap, readBuf, overlapLen);
     }
+    overlap[overlapLen] = '\0';
   }
   http.end();
   return true;  // completed scan, not found => not mil
@@ -454,7 +499,7 @@ static void otaBeginOnce() {
     u8g2.setFont(u8g2_font_6x12_tf);
     char line[48];
     snprintf(line, sizeof(line), "OTA %u%%", (unsigned)pct);
-    drawCentered(String(line), (SCREEN_HEIGHT / 2));
+    drawCentered(line, (SCREEN_HEIGHT / 2));
     u8g2.sendBuffer();
   });
   ArduinoOTA.onError([](ota_error_t error) {
@@ -473,20 +518,38 @@ static void otaBeginOnce() {
 static bool g_haveDisplayed = false;
 static FlightInfo g_lastShown;
 
+// Resolve military status via cache or network fetch. Must be called before
+// classifyOp() so the cache is populated. This is the only function that
+// performs blocking network I/O for classification.
+static void resolveMilitaryStatus(const FlightInfo &fi) {
+  if (!(FEATURE_MIL_LOOKUP && fi.hex[0])) return;
+  // Already in cache (positive or negative) — skip network
+  bool isMil = false;
+  if (milCacheLookup(fi.hex, isMil)) return;
+  // dbFlags already says military — cache it, skip network
+  if (fi.dbFlags >= 0 && (fi.dbFlags & 1)) {
+    milCacheStore(fi.hex, true, MIL_CACHE_TTL_POS);
+    return;
+  }
+  // Network fetch required
+  bool ok = fetchIsMilitaryByHex(fi.hex, isMil);
+  if (ok) {
+    milCacheStore(fi.hex, isMil, isMil ? MIL_CACHE_TTL_POS : MIL_CACHE_TTL_POS);
+  } else {
+    milCacheStore(fi.hex, false, MIL_CACHE_TTL_NEG);
+  }
+}
+
+// Pure classification — no network I/O. Relies on resolveMilitaryStatus()
+// having been called first to populate the MIL cache.
 static const char* classifyOp(const FlightInfo &fi) {
   // 1) dbFlags bit 0 = military (from API, avoids blocking /v2/mil call)
   if (fi.dbFlags >= 0 && (fi.dbFlags & 1)) return "MIL";
 
-  // 2) MIL cache / live lookup as fallback
-  if (FEATURE_MIL_LOOKUP && fi.hex[0]) {
+  // 2) MIL cache (populated by resolveMilitaryStatus)
+  if (fi.hex[0]) {
     bool isMil = false;
-    if (milCacheLookup(fi.hex, isMil)) {
-      if (isMil) return "MIL";
-    } else {
-      bool ok = fetchIsMilitaryByHex(fi.hex, isMil);
-      if (ok) milCacheStore(fi.hex, isMil);
-      if (isMil) return "MIL";
-    }
+    if (milCacheLookup(fi.hex, isMil) && isMil) return "MIL";
   }
 
   // 3) Seat-based: small aircraft (<= 15 seats) are PVT
@@ -523,11 +586,11 @@ static bool sameFlightDisplay(const FlightInfo &a, const FlightInfo &b) {
   return true;
 }
 
-static void drawCentered(const String &text, int16_t baselineY) {
-  uint16_t w = u8g2.getUTF8Width(text.c_str());
+static void drawCentered(const char *text, int16_t baselineY) {
+  uint16_t w = u8g2.getUTF8Width(text);
   int16_t x = (SCREEN_WIDTH - (int)w) / 2;
   if (x < 0) x = 0;
-  u8g2.drawUTF8(x, baselineY, text.c_str());
+  u8g2.drawUTF8(x, baselineY, text);
 }
 
 static void showSplash(const char *msgTop, const char *msgBottom) {
@@ -562,12 +625,12 @@ static void showSplash(const char *msgTop, const char *msgBottom) {
   // Draw first message
   u8g2.setFont(bodyFont);
   base = y0 + titleH + gap + bodyAscent;
-  drawCentered(String(msgTop), base);
+  drawCentered(msgTop, base);
 
   // Optional second message
   if (msgBottom) {
     base = y0 + titleH + gap + bodyH + gap + bodyAscent;
-    drawCentered(String(msgBottom), base);
+    drawCentered(msgBottom, base);
   }
 
   u8g2.sendBuffer();
@@ -575,16 +638,26 @@ static void showSplash(const char *msgTop, const char *msgBottom) {
 
 static void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
-  // Configure once in setup; do not change config while connecting
   if (!wifiInitialized) return;
-  // Begin only once; rely on auto-reconnect afterwards
-  if (wifiEverBegun) return;
-  Serial.print("[WiFi] Connecting to ");
-  Serial.println(WIFI_SSID);
-  showSplash("Connecting Wi-Fi...", WIFI_SSID);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  wifiConnecting = true;
-  wifiEverBegun = true;
+  // First attempt
+  if (!wifiEverBegun) {
+    Serial.print("[WiFi] Connecting to ");
+    Serial.println(WIFI_SSID);
+    showSplash("Connecting Wi-Fi...", WIFI_SSID);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiConnecting = true;
+    wifiEverBegun = true;
+    wifiLastAttemptAt = millis();
+    return;
+  }
+  // Periodic retry if auto-reconnect has not recovered
+  uint32_t now = millis();
+  if ((now - wifiLastAttemptAt) >= WIFI_RETRY_INTERVAL_MS) {
+    LOG_WARN("WiFi retry: calling WiFi.begin() again");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiLastAttemptAt = now;
+    wifiConnecting = true;
+  }
 }
 
 static double deg2rad(double deg) {
@@ -629,7 +702,7 @@ static FlightInfo parseClosest(JsonVariant root) {
   if (ac.size() == 0) return res;
   JsonObject obj = ac[0].as<JsonObject>();
 
-  double lat, lon;
+  double lat = NAN, lon = NAN;
   if (!extractLatLon(obj, lat, lon)) return res;
 
   // Build ident preference chain: flight -> r -> hex
@@ -653,7 +726,7 @@ static FlightInfo parseClosest(JsonVariant root) {
   // Trim trailing whitespace
   for (int i = strlen(res.ident) - 1; i >= 0 && res.ident[i] == ' '; --i) res.ident[i] = '\0';
 
-  res.altitudeFt = obj["alt_baro"].isNull() ? -1 : obj["alt_baro"].as<long>();
+  res.altitudeFt = obj["alt_baro"].isNull() ? -1 : obj["alt_baro"].as<int32_t>();
 
   // "t" = aircraft type designator (B738, A320, etc.)
   // Note: "type" is a different field (message type: adsb_icao, tisb, mlat) — do NOT use as fallback
@@ -680,27 +753,11 @@ static FlightInfo parseClosest(JsonVariant root) {
 static bool fetchNearestFlight(FlightInfo &out) {
   if (WiFi.status() != WL_CONNECTED) return false;
 
-  auto buildUrl = [](bool tls) {
-    String base = String(API_BASE);
-    if (tls) {
-      if (base.startsWith("http://")) base.replace("http://", "https://");
-      if (!base.startsWith("http")) base = String("https://") + base;
-    } else {
-      if (base.startsWith("https://")) base.replace("https://", "http://");
-      if (!base.startsWith("http")) base = String("http://") + base;
-    }
-    base += "/v2/closest/";
-    base += String(HOME_LAT, 6);
-    base += "/";
-    base += String(HOME_LON, 6);
-    base += "/";
-    base += String(SEARCH_RADIUS_KM);
-    return base;
-  };
-
-  // Single HTTPS attempt; server enforces HTTPS and may close HTTP
-  String url = buildUrl(true);
-  LOG_INFO("HTTP GET %s", url.c_str());
+  // Build URL with stack-allocated buffer (no heap allocation)
+  char url[128];
+  snprintf(url, sizeof(url), "%s/v2/closest/%.6f/%.6f/%d",
+           API_BASE, HOME_LAT, HOME_LON, SEARCH_RADIUS_KM);
+  LOG_INFO("HTTP GET %s", url);
   LOG_DEBUG("WiFi RSSI: %d dBm", WiFi.RSSI());
   LOG_DEBUG("Free heap: %u", (unsigned)ESP.getFreeHeap());
 
@@ -761,7 +818,8 @@ static bool fetchNearestFlight(FlightInfo &out) {
   FlightInfo closest = parseClosest(doc.as<JsonVariant>());
   if (closest.valid) {
     LOG_INFO("Closest %s  dist %.2f km", closest.ident, closest.distanceKm);
-    // Classify operation (MIL/COM/PVT)
+    // Resolve military status (may do network I/O), then classify
+    resolveMilitaryStatus(closest);
     const char* op = classifyOp(closest);
     strncpy(closest.opClass, op, sizeof(closest.opClass) - 1);
     closest.opClass[sizeof(closest.opClass) - 1] = '\0';
@@ -775,35 +833,68 @@ static bool fetchNearestFlight(FlightInfo &out) {
 
 // test server removed
 
+// Detect pseudo/non-aircraft types (TIS-B, MLAT, etc.) and resolve friendly name.
+// Returns true if the type is a pseudo (non-aircraft) target.
+static bool resolveFriendlyName(const char* typeCode, char* buf, size_t bufSize) {
+  bool isPseudo = false;
+  bool found = false;
+  if (typeCode[0]) {
+    found = aircraftFriendlyNameBuf(typeCode, buf, bufSize);
+  }
+  if (!found && typeCode[0]) {
+    struct { const char* prefix; const char* label; } pseudos[] = {
+      { "TISB", "TIS-B Target" }, { "ADSB", "ADS-B Target" },
+      { "MLAT", "MLAT Target" },  { "MODE", "Mode-S Target" }
+    };
+    for (auto &p : pseudos) {
+      if (strncasecmp(typeCode, p.prefix, 4) == 0) {
+        strncpy(buf, p.label, bufSize - 1);
+        buf[bufSize - 1] = '\0';
+        isPseudo = true; found = true;
+        break;
+      }
+    }
+  }
+  if (!found) {
+    strncpy(buf, "Unknown Aircraft", bufSize - 1);
+    buf[bufSize - 1] = '\0';
+  }
+  return isPseudo;
+}
+
+// Draw the bottom metric bar: distance | seats | altitude
+static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) {
+  char distStr[16] = "\xE2\x80\x94";  // em-dash
+  if (!isnan(fi.distanceKm)) snprintf(distStr, sizeof(distStr), "%.1fkm", fi.distanceKm);
+
+  char seatsStr[8] = "\xE2\x80\x94";
+  if (!isPseudo) {
+    uint16_t maxSeats = 0;
+    if (fi.seatOverride > 0) snprintf(seatsStr, sizeof(seatsStr), "%d", fi.seatOverride);
+    else if (fi.typeCode[0] && aircraftSeatMax(fi.typeCode, maxSeats) && maxSeats > 0) snprintf(seatsStr, sizeof(seatsStr), "%u", (unsigned)maxSeats);
+  }
+
+  char altStr[16] = "\xE2\x80\x94";
+  if (fi.altitudeFt >= 0) snprintf(altStr, sizeof(altStr), "%dft", (int)fi.altitudeFt);
+
+  const int cells = 3;
+  const int cellW = SCREEN_WIDTH / cells;
+  const char* items[] = { distStr, seatsStr, altStr };
+  for (int i = 0; i < cells; ++i) {
+    uint16_t bw = u8g2.getUTF8Width(items[i]);
+    int16_t cx = i * cellW + (cellW - (int)bw) / 2;
+    if (cx < 0) cx = 0;
+    u8g2.drawUTF8(cx, yBottom, items[i]);
+  }
+}
+
 static void renderFlight(const FlightInfo &fi) {
   u8g2.clearBuffer();
   u8g2.setDrawColor(1);
 
-  // 1) Top line: friendly aircraft name, allow pseudo/unknown fallbacks
+  // 1) Top line: friendly aircraft name
   char friendlyBuf[64];
-  bool isPseudo = false;
-  bool hasFriendly = false;
-  if (fi.typeCode[0]) {
-    hasFriendly = aircraftFriendlyNameBuf(fi.typeCode, friendlyBuf, sizeof(friendlyBuf));
-  }
-  if (!hasFriendly && fi.typeCode[0]) {
-    // Detect pseudo/non-aircraft types
-    if (strncasecmp(fi.typeCode, "TISB", 4) == 0) {
-      strncpy(friendlyBuf, "TIS-B Target", sizeof(friendlyBuf));
-      isPseudo = true; hasFriendly = true;
-    } else if (strncasecmp(fi.typeCode, "ADSB", 4) == 0) {
-      strncpy(friendlyBuf, "ADS-B Target", sizeof(friendlyBuf));
-      isPseudo = true; hasFriendly = true;
-    } else if (strncasecmp(fi.typeCode, "MLAT", 4) == 0) {
-      strncpy(friendlyBuf, "MLAT Target", sizeof(friendlyBuf));
-      isPseudo = true; hasFriendly = true;
-    } else if (strncasecmp(fi.typeCode, "MODE", 4) == 0) {
-      strncpy(friendlyBuf, "Mode-S Target", sizeof(friendlyBuf));
-      isPseudo = true; hasFriendly = true;
-    }
-  }
-  if (!hasFriendly) strncpy(friendlyBuf, "Unknown Aircraft", sizeof(friendlyBuf));
-  String friendly = String(friendlyBuf);
+  bool isPseudo = resolveFriendlyName(fi.typeCode, friendlyBuf, sizeof(friendlyBuf));
 
   // Bottom metrics font (~50% larger than before)
   const uint8_t *bottomFont = u8g2_font_9x18_tf;  // was 6x12
@@ -825,33 +916,13 @@ static void renderFlight(const FlightInfo &fi) {
   };
   const size_t NFONTS = sizeof(titleFonts) / sizeof(titleFonts[0]);
 
-  String line1 = friendly;
-  String line2 = String("");
+  // Use char[] buffers instead of String to avoid heap allocation
+  char line1[64];
+  char line2[64];
+  strncpy(line1, friendlyBuf, sizeof(line1) - 1);
+  line1[sizeof(line1) - 1] = '\0';
+  line2[0] = '\0';
   const uint8_t *chosen = titleFonts[NFONTS - 1];
-  auto tryWrapTwoLines = [&](const String &s, String &o1, String &o2) -> bool {
-    // Attempt to split at spaces; choose split minimizing max line width and fitting within width
-    o1 = s;
-    o2 = String("");
-    int bestIdx = -1;
-    int bestWorst = INT_MAX;
-    for (int i = 1; i < (int)s.length() - 1; ++i) {
-      if (s[i] != ' ') continue;
-      String a = s.substring(0, i);
-      String b = s.substring(i + 1);
-      uint16_t wa = u8g2.getUTF8Width(a.c_str());
-      uint16_t wb = u8g2.getUTF8Width(b.c_str());
-      if (wa <= SCREEN_WIDTH && wb <= SCREEN_WIDTH) {
-        int worst = max((int)wa, (int)wb);
-        if (worst < bestWorst) {
-          bestWorst = worst;
-          bestIdx = i;
-          o1 = a;
-          o2 = b;
-        }
-      }
-    }
-    return bestIdx >= 0;
-  };
 
   for (size_t i = 0; i < NFONTS; ++i) {
     u8g2.setFont(titleFonts[i]);
@@ -859,19 +930,41 @@ static void renderFlight(const FlightInfo &fi) {
     int16_t desc = -u8g2.getDescent();
     int16_t lh = asc + desc;
     // One-line fit within width and height
-    if (u8g2.getUTF8Width(friendly.c_str()) <= SCREEN_WIDTH && lh <= topAvail) {
+    if (u8g2.getUTF8Width(friendlyBuf) <= SCREEN_WIDTH && lh <= topAvail) {
       chosen = titleFonts[i];
-      line1 = friendly;
-      line2 = String("");
+      strncpy(line1, friendlyBuf, sizeof(line1) - 1);
+      line1[sizeof(line1) - 1] = '\0';
+      line2[0] = '\0';
       break;
     }
     // Try two-line wrap for this font if two lines fit height
     if (2 * lh + 2 <= topAvail) {
-      String a, b;
-      if (tryWrapTwoLines(friendly, a, b)) {
+      // Find best space-split minimizing max line width
+      int bestIdx = -1;
+      int bestWorst = INT_MAX;
+      size_t slen = strlen(friendlyBuf);
+      for (size_t j = 1; j < slen - 1; ++j) {
+        if (friendlyBuf[j] != ' ') continue;
+        // Temporarily null-terminate at split point to measure first half
+        char saved = friendlyBuf[j];
+        friendlyBuf[j] = '\0';
+        uint16_t wa = u8g2.getUTF8Width(friendlyBuf);
+        friendlyBuf[j] = saved;
+        uint16_t wb = u8g2.getUTF8Width(friendlyBuf + j + 1);
+        if (wa <= SCREEN_WIDTH && wb <= SCREEN_WIDTH) {
+          int worst = max((int)wa, (int)wb);
+          if (worst < bestWorst) {
+            bestWorst = worst;
+            bestIdx = (int)j;
+          }
+        }
+      }
+      if (bestIdx >= 0) {
         chosen = titleFonts[i];
-        line1 = a;
-        line2 = b;
+        memcpy(line1, friendlyBuf, bestIdx);
+        line1[bestIdx] = '\0';
+        strncpy(line2, friendlyBuf + bestIdx + 1, sizeof(line2) - 1);
+        line2[sizeof(line2) - 1] = '\0';
         break;
       }
     }
@@ -882,44 +975,19 @@ static void renderFlight(const FlightInfo &fi) {
   int16_t ascT = u8g2.getAscent();
   int16_t descT = -u8g2.getDescent();
   int16_t lhT = ascT + descT;
-  int16_t totalTitleH = lhT + ((line2.length() > 0) ? (2 + lhT) : 0);
+  int16_t totalTitleH = lhT + ((line2[0] != '\0') ? (2 + lhT) : 0);
   if (totalTitleH > topAvail) totalTitleH = topAvail;  // safety
   int16_t yStart = (topAvail - totalTitleH) / 2 + ascT;
   drawCentered(line1, yStart);
-  if (line2.length() > 0) {
+  if (line2[0] != '\0') {
     drawCentered(line2, yStart + lhT + 2);
   }
 
-  // 2) Bottom line: distance, seats, altitude (small font), evenly spaced across bottom
+  // 2) Bottom line: distance, seats, altitude
   u8g2.setFont(bottomFont);
   int16_t descent = u8g2.getDescent();
   int16_t yBottom = SCREEN_HEIGHT - 1 - (descent < 0 ? -descent : descent);
-
-  char distStr[16] = "\xE2\x80\x94";  // em-dash
-  if (!isnan(fi.distanceKm)) snprintf(distStr, sizeof(distStr), "%.1fkm", fi.distanceKm);
-
-  char seatsStr[8] = "\xE2\x80\x94";  // em-dash
-  if (!isPseudo) {
-    uint16_t maxSeats = 0;
-    if (fi.seatOverride > 0) snprintf(seatsStr, sizeof(seatsStr), "%d", fi.seatOverride);
-    else if (fi.typeCode[0] && aircraftSeatMax(fi.typeCode, maxSeats) && maxSeats > 0) snprintf(seatsStr, sizeof(seatsStr), "%u", (unsigned)maxSeats);
-  }
-
-  char altStr[16] = "\xE2\x80\x94";  // em-dash
-  if (fi.altitudeFt >= 0) snprintf(altStr, sizeof(altStr), "%ldft", fi.altitudeFt);
-
-  const int cells = 3;
-  const int cellW = SCREEN_WIDTH / cells;
-  auto drawCenteredInCell = [&](int idx, const char* text) {
-    uint16_t bw = u8g2.getUTF8Width(text);
-    int16_t cx = idx * cellW + (cellW - (int)bw) / 2;
-    if (cx < 0) cx = 0;
-    u8g2.drawUTF8(cx, yBottom, text);
-  };
-
-  drawCenteredInCell(0, distStr);
-  drawCenteredInCell(1, seatsStr);
-  drawCenteredInCell(2, altStr);
+  drawBottomBar(fi, isPseudo, yBottom);
 
   u8g2.sendBuffer();
 }
@@ -990,7 +1058,9 @@ void setup() {
   WiFi.setSleep(true);
   wifiInitialized = true;
   // Display init (U8g2 handles SPI HW init for HW SPI constructor)
-  u8g2.begin();
+  if (!u8g2.begin()) {
+    LOG_ERROR("Display init failed");
+  }
   u8g2.clearBuffer();
   u8g2.sendBuffer();
 
@@ -1045,6 +1115,7 @@ void loop() {
 
   uint32_t now = millis();
   if (now >= g_nextFetchAt || g_nextFetchAt == 0) {
+    checkHeap();
     FlightInfo nearest;
     if (fetchNearestFlight(nearest)) {
       g_fetchFailCount = 0;
@@ -1056,9 +1127,14 @@ void loop() {
         relaysShowCategory(g_lastShown.opClass);
       }
     } else {
-      g_fetchFailCount = min((uint8_t)(g_fetchFailCount + 1), (uint8_t)8);
+      g_fetchFailCount = min((uint8_t)(g_fetchFailCount + 1), (uint8_t)255);
       g_nextFetchAt = millis() + backoffMs(g_fetchFailCount);
-      LOG_WARN("Fetch failed (attempt %d), next retry in %lu ms", g_fetchFailCount, backoffMs(g_fetchFailCount));
+      LOG_WARN("Fetch failed (attempt %d), next retry in %lu ms", g_fetchFailCount, (unsigned long)backoffMs(g_fetchFailCount));
+      // Circuit breaker: restart after sustained failures to recover network stack
+      if (g_fetchFailCount >= FETCH_FAIL_RESTART_THRESHOLD) {
+        LOG_ERROR("API unreachable for %d attempts, restarting", g_fetchFailCount);
+        ESP.restart();
+      }
       if (!g_haveDisplayed) {
         showSplash("No data", "Check Wi-Fi/API");
       }
