@@ -764,6 +764,10 @@ static FlightInfo parseClosest(JsonVariant root) {
   else if (!obj["alt_baro"].isNull()) res.altitudeFt = obj["alt_baro"].as<int32_t>();
   else if (!obj["alt_geom"].isNull()) res.altitudeFt = obj["alt_geom"].as<int32_t>();
   else res.altitudeFt = -1;
+  // Readings at or below 0 ft mean "on the surface" for display purposes —
+  // seaplanes and taxiing aircraft without a squat switch report "airborne"
+  // with baro/geom altitudes of 0 or slightly negative near sea level.
+  if (res.altitudeFt <= 0 && res.altitudeFt != -1) res.altitudeFt = ALT_GROUND;
 
   // "t" = aircraft type designator (B738, A320, etc.)
   // Note: "type" is a different field (message type: adsb_icao, tisb, mlat) — do NOT use as fallback
