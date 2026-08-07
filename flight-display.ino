@@ -23,13 +23,21 @@
 #include "aircraft_types.h"
 #include "log.h"
 
+// Sentinel for alt_baro == "ground" (aircraft on the surface)
+static constexpr int32_t ALT_GROUND = -2;
+
+// Distinguishes "API answered, nothing displayable nearby" from real failures
+// so quiet skies don't trigger backoff or the restart circuit breaker.
+enum FetchResult : uint8_t { FETCH_OK, FETCH_EMPTY, FETCH_FAIL };
+
 // FlightInfo is used across parsing, test overrides, and rendering.
 // Uses fixed char arrays to avoid heap allocation in hot paths.
 struct FlightInfo {
   char ident[16];      // flight/callsign or registration/hex fallback
   char typeCode[8];    // aircraft type (t)
   char category[4];    // raw ADS-B category code (A1-A7, B1-B7, C1-C3)
-  int32_t altitudeFt;
+  char desc[48];       // API type description; title fallback when table misses
+  int32_t altitudeFt;  // -1 = unknown, ALT_GROUND = on ground
   double lat;
   double lon;
   double distanceKm;
@@ -45,6 +53,7 @@ struct FlightInfo {
     ident[0] = '\0';
     typeCode[0] = '\0';
     category[0] = '\0';
+    desc[0] = '\0';
     hex[0] = '\0';
     opClass[0] = '\0';
   }
@@ -188,6 +197,12 @@ static constexpr uint32_t MIL_LOOKUP_HARD_TIMEOUT_MS = 15000;  // absolute wall-
 #define FETCH_FAIL_RESTART_THRESHOLD 60  // ~30 min at max backoff
 #endif
 
+// Max time a flight stays on screen without a successful refresh before the
+// display falls back to the "No data" splash instead of showing stale data
+#ifndef STALE_DISPLAY_MAX_MS
+#define STALE_DISPLAY_MAX_MS (5UL * 60UL * 1000UL)  // 5 minutes
+#endif
+
 // Exponential backoff with jitter for retry logic
 static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 60000) {
   uint32_t exp = base << min((uint8_t)attempt, (uint8_t)5);
@@ -196,6 +211,7 @@ static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 
 }
 static uint8_t g_fetchFailCount = 0;
 static uint32_t g_nextFetchAt = 0;
+static uint32_t g_lastDataMs = 0;  // millis() of last successful fetch with data
 
 static void checkHeap() {
 #if defined(ESP32)
@@ -434,11 +450,16 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
   // Absolute wall-clock timeout — never resets per chunk (rollover-safe subtraction)
   uint32_t startTime = millis();
   Stream &s = http.getStream();
+  bool complete = false;  // true only if we reached a clean end-of-stream
   while ((millis() - startTime) < MIL_LOOKUP_HARD_TIMEOUT_MS) {
     int n = s.readBytes(readBuf, CHUNK);
     if (n <= 0) {
       yield();  // cooperative yield, no blocking delay()
-      if (!s.available()) break;
+      if (!s.available()) {
+        // Drained + server closed = clean EOF; still connected = stall
+        complete = !client.connected();
+        break;
+      }
       continue;
     }
     // Lowercase the new data for case-insensitive matching
@@ -463,6 +484,12 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
     overlap[overlapLen] = '\0';
   }
   http.end();
+  if (!complete) {
+    // Timed-out or stalled scan is NOT an authoritative "not military" —
+    // report failure so the caller caches with the short negative TTL.
+    LOG_WARN("MIL scan incomplete (timeout/stall), result unknown");
+    return false;
+  }
   return true;  // completed scan, not found => not mil
 }
 
@@ -534,7 +561,7 @@ static void resolveMilitaryStatus(const FlightInfo &fi) {
   // Network fetch required
   bool ok = fetchIsMilitaryByHex(fi.hex, isMil);
   if (ok) {
-    milCacheStore(fi.hex, isMil, isMil ? MIL_CACHE_TTL_POS : MIL_CACHE_TTL_POS);
+    milCacheStore(fi.hex, isMil, isMil ? MIL_CACHE_TTL_POS : MIL_CACHE_TTL_NEG);
   } else {
     milCacheStore(fi.hex, false, MIL_CACHE_TTL_NEG);
   }
@@ -560,8 +587,9 @@ static const char* classifyOp(const FlightInfo &fi) {
     }
   }
 
-  // 4) ADS-B category as supplementary signal when type is unknown
-  if (fi.category[0] && !fi.typeCode[0]) {
+  // 4) ADS-B category as supplementary signal when seats didn't classify
+  // (unknown type, or a known type with no seat data e.g. freighters)
+  if (fi.category[0]) {
     // A1=Light, A7=Rotorcraft → likely private
     if (strcmp(fi.category, "A1") == 0 || strcmp(fi.category, "A7") == 0) return "PVT";
     // A3=Large, A4=High vortex, A5=Heavy → likely commercial
@@ -679,11 +707,10 @@ static double haversineKm(double lat1, double lon1, double lat2, double lon2) {
 #endif
 
 static bool extractLatLon(JsonObject obj, double &outLat, double &outLon) {
-  // Only accept positions that are not too stale
-  if (obj.containsKey("seen_pos")) {
-    double seenPos = obj["seen_pos"].as<double>();
-    if (seenPos > POSITION_MAX_AGE_S) return false;
-  }
+  // Only accept positions with a known, fresh age. No seen_pos = unknown
+  // age = don't trust it.
+  if (!obj.containsKey("seen_pos")) return false;
+  if (obj["seen_pos"].as<double>() > POSITION_MAX_AGE_S) return false;
   if (obj.containsKey("lat") && obj.containsKey("lon")) {
     outLat = obj["lat"].as<double>();
     outLon = obj["lon"].as<double>();
@@ -726,7 +753,10 @@ static FlightInfo parseClosest(JsonVariant root) {
   // Trim trailing whitespace
   for (int i = strlen(res.ident) - 1; i >= 0 && res.ident[i] == ' '; --i) res.ident[i] = '\0';
 
-  res.altitudeFt = obj["alt_baro"].isNull() ? -1 : obj["alt_baro"].as<int32_t>();
+  // alt_baro is a number in feet, or the string "ground" for surface aircraft
+  if (obj["alt_baro"].isNull()) res.altitudeFt = -1;
+  else if (obj["alt_baro"].is<const char*>()) res.altitudeFt = ALT_GROUND;
+  else res.altitudeFt = obj["alt_baro"].as<int32_t>();
 
   // "t" = aircraft type designator (B738, A320, etc.)
   // Note: "type" is a different field (message type: adsb_icao, tisb, mlat) — do NOT use as fallback
@@ -735,6 +765,10 @@ static FlightInfo parseClosest(JsonVariant root) {
 
   const char* catSrc = obj["category"].isNull() ? nullptr : obj["category"].as<const char*>();
   if (catSrc) { strncpy(res.category, catSrc, sizeof(res.category) - 1); res.category[sizeof(res.category) - 1] = '\0'; }
+
+  // "desc" = full type description from the aircraft DB (title fallback)
+  const char* descSrc = obj["desc"].isNull() ? nullptr : obj["desc"].as<const char*>();
+  if (descSrc) { strncpy(res.desc, descSrc, sizeof(res.desc) - 1); res.desc[sizeof(res.desc) - 1] = '\0'; }
 
   const char* hexSrc = obj["hex"].isNull() ? nullptr : obj["hex"].as<const char*>();
   if (hexSrc) { strncpy(res.hex, hexSrc, sizeof(res.hex) - 1); res.hex[sizeof(res.hex) - 1] = '\0'; }
@@ -750,8 +784,8 @@ static FlightInfo parseClosest(JsonVariant root) {
   return res;
 }
 
-static bool fetchNearestFlight(FlightInfo &out) {
-  if (WiFi.status() != WL_CONNECTED) return false;
+static FetchResult fetchNearestFlight(FlightInfo &out) {
+  if (WiFi.status() != WL_CONNECTED) return FETCH_FAIL;
 
   // Build URL with stack-allocated buffer (no heap allocation)
   char url[128];
@@ -773,7 +807,7 @@ static bool fetchNearestFlight(FlightInfo &out) {
   client.setTimeout(clientTimeoutSec);
   if (!http.begin(client, url)) {
     Serial.println("[HTTP] begin() failed (TLS)");
-    return false;
+    return FETCH_FAIL;
   }
   http.addHeader("Accept", "application/json");
   http.addHeader("Accept-Encoding", "identity");
@@ -785,7 +819,7 @@ static bool fetchNearestFlight(FlightInfo &out) {
   if (code != HTTP_CODE_OK) {
     LOG_WARN("HTTP error: %s", http.errorToString(code).c_str());
     http.end();
-    return false;
+    return FETCH_FAIL;
   }
 
   size_t contentLength = http.getSize();
@@ -805,6 +839,7 @@ static bool fetchNearestFlight(FlightInfo &out) {
   acObj["seen_pos"] = true;
   acObj["category"] = true;
   acObj["dbFlags"] = true;  // bit 0 = military
+  acObj["desc"] = true;     // full type description (title fallback)
 
   StaticJsonDocument<2048> doc;  // stack-allocated; filtered single-aircraft response is well under 1KB
   // Prefer streamed parsing to minimize RAM and fragmentation
@@ -812,7 +847,7 @@ static bool fetchNearestFlight(FlightInfo &out) {
   http.end();
   if (err) {
     LOG_WARN("JSON parse error (streamed): %s", err.c_str());
-    return false;
+    return FETCH_FAIL;
   }
 
   FlightInfo closest = parseClosest(doc.as<JsonVariant>());
@@ -825,17 +860,20 @@ static bool fetchNearestFlight(FlightInfo &out) {
     closest.opClass[sizeof(closest.opClass) - 1] = '\0';
     LOG_INFO("Classified op: %s", closest.opClass);
     out = closest;
-    return true;
+    return FETCH_OK;
   }
+  // Valid API response but no displayable aircraft (empty, or position too stale)
   LOG_INFO("No valid aircraft found in response");
-  return false;
+  return FETCH_EMPTY;
 }
 
 // test server removed
 
-// Detect pseudo/non-aircraft types (TIS-B, MLAT, etc.) and resolve friendly name.
+// Resolve display title: local table -> pseudo targets (TIS-B, MLAT, etc.)
+// -> API desc -> raw type code -> "Unknown Aircraft".
 // Returns true if the type is a pseudo (non-aircraft) target.
-static bool resolveFriendlyName(const char* typeCode, char* buf, size_t bufSize) {
+static bool resolveFriendlyName(const FlightInfo &fi, char* buf, size_t bufSize) {
+  const char* typeCode = fi.typeCode;
   bool isPseudo = false;
   bool found = false;
   if (typeCode[0]) {
@@ -854,6 +892,16 @@ static bool resolveFriendlyName(const char* typeCode, char* buf, size_t bufSize)
         break;
       }
     }
+  }
+  if (!found && fi.desc[0]) {
+    strncpy(buf, fi.desc, bufSize - 1);
+    buf[bufSize - 1] = '\0';
+    found = true;
+  }
+  if (!found && typeCode[0]) {
+    strncpy(buf, typeCode, bufSize - 1);
+    buf[bufSize - 1] = '\0';
+    found = true;
   }
   if (!found) {
     strncpy(buf, "Unknown Aircraft", bufSize - 1);
@@ -875,7 +923,8 @@ static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) 
   }
 
   char altStr[16] = "\xE2\x80\x94";
-  if (fi.altitudeFt >= 0) snprintf(altStr, sizeof(altStr), "%dft", (int)fi.altitudeFt);
+  if (fi.altitudeFt == ALT_GROUND) snprintf(altStr, sizeof(altStr), "GND");
+  else if (fi.altitudeFt >= 0) snprintf(altStr, sizeof(altStr), "%dft", (int)fi.altitudeFt);
 
   const int cells = 3;
   const int cellW = SCREEN_WIDTH / cells;
@@ -894,7 +943,7 @@ static void renderFlight(const FlightInfo &fi) {
 
   // 1) Top line: friendly aircraft name
   char friendlyBuf[64];
-  bool isPseudo = resolveFriendlyName(fi.typeCode, friendlyBuf, sizeof(friendlyBuf));
+  bool isPseudo = resolveFriendlyName(fi, friendlyBuf, sizeof(friendlyBuf));
 
   // Bottom metrics font (~50% larger than before)
   const uint8_t *bottomFont = u8g2_font_9x18_tf;  // was 6x12
@@ -1117,8 +1166,10 @@ void loop() {
   if (now >= g_nextFetchAt || g_nextFetchAt == 0) {
     checkHeap();
     FlightInfo nearest;
-    if (fetchNearestFlight(nearest)) {
+    FetchResult fr = fetchNearestFlight(nearest);
+    if (fr == FETCH_OK) {
       g_fetchFailCount = 0;
+      g_lastDataMs = millis();
       g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
       if (!g_haveDisplayed || !sameFlightDisplay(nearest, g_lastShown)) {
         renderFlight(nearest);
@@ -1126,6 +1177,16 @@ void loop() {
         g_haveDisplayed = true;
         relaysShowCategory(g_lastShown.opClass);
       }
+    } else if (fr == FETCH_EMPTY) {
+      // API healthy, sky quiet: normal interval, no failure count, and don't
+      // keep showing an aircraft the API says is no longer there
+      g_fetchFailCount = 0;
+      g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
+      if (g_haveDisplayed) {
+        g_haveDisplayed = false;
+        g_lastShown = FlightInfo();
+      }
+      showSplash("No aircraft nearby");
     } else {
       g_fetchFailCount = min((uint8_t)(g_fetchFailCount + 1), (uint8_t)255);
       g_nextFetchAt = millis() + backoffMs(g_fetchFailCount);
@@ -1134,6 +1195,12 @@ void loop() {
       if (g_fetchFailCount >= FETCH_FAIL_RESTART_THRESHOLD) {
         LOG_ERROR("API unreachable for %d attempts, restarting", g_fetchFailCount);
         ESP.restart();
+      }
+      // Stale-data end of life: stop showing a flight we can't refresh
+      if (g_haveDisplayed && (millis() - g_lastDataMs) > STALE_DISPLAY_MAX_MS) {
+        LOG_WARN("Displayed data stale > %lu ms, clearing", (unsigned long)STALE_DISPLAY_MAX_MS);
+        g_haveDisplayed = false;
+        g_lastShown = FlightInfo();
       }
       if (!g_haveDisplayed) {
         showSplash("No data", "Check Wi-Fi/API");

@@ -8,14 +8,15 @@
 // Rich dataset: ICAO/IATA/manufacturer/model/max seats
 struct AircraftTypeInfo {
   const char* icao;
-  const char* iata;  // may be empty
+  const char* iata;  // informational only — not consulted by lookups (API "t" is ICAO)
   const char* manufacturer;
   const char* model;
   uint16_t maxSeats;  // upper seat count only
 };
 
-// Table is sorted by ICAO code (case-insensitive) to enable binary search.
-// IATA variant entries (same ICAO, different IATA) are grouped together.
+// Table is sorted by ICAO code (case-insensitive) with unique keys to enable
+// binary search. Variant sub-types sharing an ICAO code (freighter/winglet)
+// are not listed separately — the "t" field cannot distinguish them.
 static const AircraftTypeInfo kTypeInfo[] = {
   { "A10", "", "Fairchild", "A-10", 0 },
   { "A124", "", "Antonov", "An-124 Ruslan", 0 },
@@ -117,30 +118,19 @@ static const AircraftTypeInfo kTypeInfo[] = {
   { "B731", "731", "Boeing", "737-100", 104 },
   { "B732", "732", "Boeing", "737-200", 130 },
   { "B733", "733", "Boeing", "737-300", 149 },
-  { "B733", "73C", "Boeing", "737-300 Winglets", 149 },
-  { "B733", "73Y", "Boeing", "737-300 Freighter", 0 },
   { "B734", "734", "Boeing", "737-400", 168 },
-  { "B734", "73P", "Boeing", "737-400 Freighter", 0 },
   { "B735", "735", "Boeing", "737-500", 132 },
   { "B736", "736", "Boeing", "737-600", 132 },
   { "B737", "737", "Boeing", "737-700", 149 },
-  { "B737", "73W", "Boeing", "737-700 Winglets", 149 },
   { "B738", "738", "Boeing", "737-800", 189 },
-  { "B738", "73H", "Boeing", "737-800 Winglets", 189 },
-  { "B738", "73K", "Boeing", "737-800 Freighter Winglets", 0 },
-  { "B738", "73U", "Boeing", "737-800 Freighter", 0 },
   { "B739", "739", "Boeing", "737-900", 220 },
-  { "B739", "73J", "Boeing", "737-900 Winglets", 220 },
   { "B741", "741", "Boeing", "747-100", 452 },
   { "B741F", "", "Boeing", "747-100F (pax eq.)", 0 },
   { "B742", "742", "Boeing", "747-200", 452 },
   { "B743", "743", "Boeing", "747-300", 496 },
   { "B744", "744", "Boeing", "747-400", 524 },
   { "B748", "748", "Boeing", "747-8", 467 },
-  { "B748", "74H", "Boeing", "747-8I", 467 },
-  { "B748", "74N", "Boeing", "747-8F", 0 },
   { "B74R", "74R", "Boeing", "747SR", 550 },
-  { "B74R", "74V", "Boeing", "747SR Freighter", 0 },
   { "B74S", "74L", "Boeing", "747SP", 313 },
   { "B752", "752", "Boeing", "757-200", 235 },
   { "B753", "753", "Boeing", "757-300", 295 },
@@ -152,7 +142,6 @@ static const AircraftTypeInfo kTypeInfo[] = {
   { "B778", "778", "Boeing", "777-8", 384 },
   { "B779", "779", "Boeing", "777-9", 426 },
   { "B77L", "77L", "Boeing", "777-200LR", 317 },
-  { "B77L", "77X", "Boeing", "777-200 Freighter", 0 },
   { "B77W", "77W", "Boeing", "777-300ER", 451 },
   { "B788", "788", "Boeing", "787-8", 248 },
   { "B789", "789", "Boeing", "787-9", 296 },
@@ -279,11 +268,7 @@ static const AircraftTypeInfo kTypeInfo[] = {
   { "DA40", "", "Diamond", "DA40", 4 },
   { "DA42", "", "Diamond", "DA42 Twin Star", 4 },
   { "DA62", "", "Diamond", "DA62", 7 },
-  { "DC10", "D11", "Douglas", "DC-10-10/-15 Passenger", 380 },
-  { "DC10", "D1C", "Douglas", "DC-10-30/-40 Passenger", 380 },
-  { "DC10", "D1M", "Douglas", "DC-10-30 Combi", 380 },
-  { "DC10", "D1X", "Douglas", "DC-10-10 Freighter", 0 },
-  { "DC10", "D1Y", "Douglas", "DC-10-30/-40 Freighter", 0 },
+  { "DC10", "D11", "Douglas", "DC-10", 380 },
   { "DC3", "", "Douglas", "DC-3", 32 },
   { "DC3S", "", "Douglas", "Super DC-3", 28 },
   { "DC3T", "", "Basler", "BT-67 (Turbo DC-3)", 18 },
@@ -423,8 +408,6 @@ static const AircraftTypeInfo kTypeInfo[] = {
   { "M5", "", "Maule", "M-5", 4 },
   { "M600", "", "Piper", "M600", 6 },
   { "MD11", "M11", "McDonnell Douglas", "MD-11", 410 },
-  { "MD11", "M1F", "McDonnell Douglas", "MD-11F", 0 },
-  { "MD11", "M1M", "McDonnell Douglas", "MD-11C", 0 },
   { "MD81", "M81", "McDonnell Douglas", "MD-81", 155 },
   { "MD82", "M82", "McDonnell Douglas", "MD-82", 165 },
   { "MD83", "M83", "McDonnell Douglas", "MD-83", 165 },
@@ -535,51 +518,24 @@ static const size_t kTypeInfoCount = sizeof(kTypeInfo) / sizeof(kTypeInfo[0]);
 // --- Lookup helpers ---
 
 // Binary search by ICAO code. Returns pointer to match or nullptr.
-// When duplicate ICAO entries exist (e.g. passenger + freighter variants),
-// returns the entry with the highest maxSeats (preferring passenger over cargo).
-// Table MUST be sorted by ICAO (case-insensitive).
+// Table MUST be sorted by ICAO (case-insensitive) with unique keys.
 static const AircraftTypeInfo* findByIcao(const char* icao) {
   if (!icao || !*icao) return nullptr;
   int lo = 0, hi = (int)kTypeInfoCount - 1;
   while (lo <= hi) {
     int mid = (lo + hi) / 2;
     int cmp = strcasecmp(icao, kTypeInfo[mid].icao);
-    if (cmp == 0) {
-      // Found a match; scan adjacent entries to find best (highest seats)
-      const AircraftTypeInfo* best = &kTypeInfo[mid];
-      // Scan backward
-      for (int j = mid - 1; j >= 0 && strcasecmp(icao, kTypeInfo[j].icao) == 0; --j) {
-        if (kTypeInfo[j].maxSeats > best->maxSeats) best = &kTypeInfo[j];
-      }
-      // Scan forward
-      for (int j = mid + 1; j < (int)kTypeInfoCount && strcasecmp(icao, kTypeInfo[j].icao) == 0; ++j) {
-        if (kTypeInfo[j].maxSeats > best->maxSeats) best = &kTypeInfo[j];
-      }
-      return best;
-    }
+    if (cmp == 0) return &kTypeInfo[mid];
     if (cmp < 0) hi = mid - 1;
     else lo = mid + 1;
   }
   return nullptr;
 }
 
-// Linear scan for IATA code match. Returns pointer or nullptr.
-static const AircraftTypeInfo* findByIata(const char* iata) {
-  if (!iata || !*iata) return nullptr;
-  for (size_t i = 0; i < kTypeInfoCount; ++i) {
-    if (kTypeInfo[i].iata[0] && strcasecmp(iata, kTypeInfo[i].iata) == 0) {
-      return &kTypeInfo[i];
-    }
-  }
-  return nullptr;
-}
-
-// Unified lookup: tries ICAO binary search first, then IATA linear scan.
+// ICAO-only lookup. The API's "t" field is always an ICAO designator, so an
+// IATA fallback here could silently match a different aircraft's IATA code.
 static const AircraftTypeInfo* aircraftLookup(const char* code) {
-  if (!code || !*code) return nullptr;
-  const AircraftTypeInfo* result = findByIcao(code);
-  if (result) return result;
-  return findByIata(code);
+  return findByIcao(code);
 }
 
 // Family-prefix heuristics for seat count when no exact table match exists.

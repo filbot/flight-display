@@ -32,6 +32,7 @@ Display driver: `U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI` with full framebuffer.
 
 - **IDE**: Arduino IDE or `arduino-cli`
 - **Board**: ESP32 Dev Module (`esp32:esp32:esp32`)
+- **Partition scheme**: **Minimal SPIFFS (1.9MB APP with OTA)** — required; the sketch exceeds the default 1.25MB app partition. CLI: `arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs .`. Do NOT use "Huge APP" (removes the second app slot and breaks OTA).
 - **Libraries**: U8g2 (olikraus), ArduinoJson 6.x, WiFi/WiFiClientSecure/HTTPClient/WebServer (ESP32 core)
 - **Setup**: Copy `example-config.h` to `config.h`, fill in WiFi credentials, `HOME_LAT`/`HOME_LON`, `SEARCH_RADIUS_KM`
 
@@ -61,8 +62,8 @@ Control Relays (status=ON, exactly one category relay ON)
 - **Base**: `https://api.adsb.lol`
 - **Endpoint**: `GET /v2/closest/{lat}/{lon}/{radius}` — returns nearest aircraft
 - **MIL endpoint**: `GET /v2/mil` — all military aircraft (used for cache misses)
-- **Fields used**: `hex`, `flight`, `r`, `t`, `type`, `alt_baro`, `lat`, `lon`, `seen_pos`, `category`, `dbFlags`
-- **Fields available but unused**: `gs` (ground speed), `track`, `geom_rate`, `nav_altitude_mcp`, `emergency`
+- **Fields used**: `hex`, `flight`, `r`, `t`, `alt_baro`, `lat`, `lon`, `seen_pos`, `category`, `dbFlags`, `desc` (title fallback for unknown types)
+- **Fields available but unused**: `gs` (ground speed), `track`, `geom_rate`, `nav_altitude_mcp`, `emergency`, `type` (message type — never use as a `t` fallback), `ownOp` (operator)
 
 ## Coding Conventions
 
@@ -93,9 +94,10 @@ Examples:
 
 ## Key Patterns
 
-- **Classification priority**: dbFlags military bit → MIL cache lookup → seat count (≤15 = PVT) → ADS-B category → callsign presence (has callsign = COM, else PVT)
-- **MIL cache**: 16-entry array, 6-hour TTL, fixed `char[8]` hex keys
-- **Aircraft lookup**: Binary search on sorted `kTypeInfo[]` by ICAO, linear IATA fallback, then ~15 family-prefix heuristics
+- **Classification priority**: dbFlags military bit → MIL cache lookup → seat count (≤15 = PVT) → ADS-B category (runs whenever seats didn't classify) → callsign presence (has callsign = COM, else PVT)
+- **MIL cache**: 16-entry array, 6h positive / 1h negative TTL, fixed `char[8]` hex keys. An incomplete `/v2/mil` scan (timeout/stall) reports failure, never "not military".
+- **Aircraft lookup**: Binary search on sorted, unique-key `kTypeInfo[]` by ICAO only (no IATA fallback — API `t` is always ICAO), then ~15 family-prefix heuristics. Unknown types fall back to the API `desc` field, then the raw code.
+- **Staleness**: Positions without fresh `seen_pos` are rejected. Displayed flight clears to splash after `STALE_DISPLAY_MAX_MS` (default 5 min) without a successful refresh; an empty-but-valid API response ("no aircraft nearby") clears immediately and doesn't count as a fetch failure.
 - **Display rendering**: Font cascade (32pt → 24pt → 20pt → 10pt → 9pt → 6pt) with 2-line word wrapping. Bottom bar: distance | seats | altitude in 3 equal cells.
 - **Relay mapping**: Status=IN1, PVT=IN2, COM=IN3, MIL=IN4 (configurable via `RELAY_*_PIN`)
 - **Test override**: `PUT /test/closest` with JSON body to inject test flight data (5-min TTL)
@@ -107,3 +109,5 @@ Examples:
 - The `/v2/mil` endpoint returns ALL military aircraft globally and streams the full response — this blocks loop() for potentially seconds. Use `dbFlags` first.
 - `WiFi.setAutoReconnect(true)` handles most reconnects but has no backoff
 - `client.setInsecure()` — no TLS cert verification (standard for ESP32 IoT)
+- `alt_baro` is a number in feet OR the string `"ground"` — parsed to the `ALT_GROUND` sentinel (-2), rendered as `GND`
+- Duplicate ICAO variants (freighter/winglet) must NOT be added back to `kTypeInfo[]` — the `t` field can't distinguish them, and binary search requires unique sorted keys
