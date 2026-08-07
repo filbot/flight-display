@@ -203,6 +203,11 @@ static constexpr uint32_t MIL_LOOKUP_HARD_TIMEOUT_MS = 15000;  // absolute wall-
 #define STALE_DISPLAY_MAX_MS (5UL * 60UL * 1000UL)  // 5 minutes
 #endif
 
+// Bottom-bar pixel shift interval (OLED image-sticking mitigation)
+#ifndef PIXEL_SHIFT_INTERVAL_MS
+#define PIXEL_SHIFT_INTERVAL_MS (3UL * 60UL * 1000UL)  // 3 minutes per step
+#endif
+
 // Exponential backoff with jitter for retry logic
 static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 60000) {
   uint32_t exp = base << min((uint8_t)attempt, (uint8_t)5);
@@ -913,6 +918,15 @@ static bool resolveFriendlyName(const FlightInfo &fi, char* buf, size_t bufSize)
   return isPseudo;
 }
 
+// Cycle through 1px offsets to prevent OLED image sticking on the mostly
+// static bottom bar. y only shifts up — the glyphs already sit at the bottom
+// edge of the panel opening, so shifting down would clip them.
+static const int8_t kPixelShifts[][2] = { {0,0}, {1,0}, {1,-1}, {0,-1}, {-1,-1}, {-1,0} };
+static constexpr uint8_t kPixelShiftCount = sizeof(kPixelShifts) / sizeof(kPixelShifts[0]);
+static uint8_t pixelShiftIdx() {
+  return (uint8_t)((millis() / PIXEL_SHIFT_INTERVAL_MS) % kPixelShiftCount);
+}
+
 // Draw the bottom metric bar: distance | seats | altitude
 static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) {
   char distStr[16] = "\xE2\x80\x94";  // em-dash
@@ -929,6 +943,9 @@ static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) 
   if (fi.altitudeFt == ALT_GROUND) snprintf(altStr, sizeof(altStr), "GND");
   else if (fi.altitudeFt >= 0) snprintf(altStr, sizeof(altStr), "%dft", (int)fi.altitudeFt);
 
+  const int8_t dx = kPixelShifts[pixelShiftIdx()][0];
+  const int8_t dy = kPixelShifts[pixelShiftIdx()][1];
+
   const int cells = 3;
   const int cellW = SCREEN_WIDTH / cells;
   const char* items[] = { distStr, seatsStr, altStr };
@@ -936,7 +953,7 @@ static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) 
     uint16_t bw = u8g2.getUTF8Width(items[i]);
     int16_t cx = i * cellW + (cellW - (int)bw) / 2;
     if (cx < 0) cx = 0;
-    u8g2.drawUTF8(cx, yBottom, items[i]);
+    u8g2.drawUTF8(cx + dx, yBottom + dy, items[i]);
   }
 }
 
@@ -1149,6 +1166,15 @@ void loop() {
   }
 #endif
 
+  // Re-render on pixel-shift step changes — a static scene never re-renders
+  // through the data path, so the anti-sticking nudge must force it
+  static uint8_t s_lastShiftIdx = 0;
+  uint8_t shiftIdx = pixelShiftIdx();
+  if (shiftIdx != s_lastShiftIdx) {
+    s_lastShiftIdx = shiftIdx;
+    if (g_haveDisplayed) renderFlight(g_lastShown);
+  }
+
   // If test override is active, render it preferentially
 #if FEATURE_TEST_ENDPOINT
   if (g_test.active && (int32_t)(millis() - g_test.expiresAt) < 0) {
@@ -1166,7 +1192,8 @@ void loop() {
 #endif
 
   uint32_t now = millis();
-  if (now >= g_nextFetchAt || g_nextFetchAt == 0) {
+  // Rollover-safe: signed difference handles millis() wrap at ~49.7 days
+  if ((int32_t)(now - g_nextFetchAt) >= 0) {
     checkHeap();
     FlightInfo nearest;
     FetchResult fr = fetchNearestFlight(nearest);
@@ -1191,14 +1218,19 @@ void loop() {
       }
       showSplash("No aircraft nearby");
     } else {
-      g_fetchFailCount = min((uint8_t)(g_fetchFailCount + 1), (uint8_t)255);
-      g_nextFetchAt = millis() + backoffMs(g_fetchFailCount);
-      LOG_WARN("Fetch failed (attempt %d), next retry in %lu ms", g_fetchFailCount, (unsigned long)backoffMs(g_fetchFailCount));
-      // Circuit breaker: restart after sustained failures to recover network stack
-      if (g_fetchFailCount >= FETCH_FAIL_RESTART_THRESHOLD) {
-        LOG_ERROR("API unreachable for %d attempts, restarting", g_fetchFailCount);
-        ESP.restart();
+      // Wi-Fi outages don't feed the restart breaker — the reconnect logic
+      // owns those; the breaker is for "API unreachable despite Wi-Fi up"
+      if (WiFi.status() == WL_CONNECTED) {
+        g_fetchFailCount = min((uint8_t)(g_fetchFailCount + 1), (uint8_t)255);
+        // Circuit breaker: restart after sustained failures to recover network stack
+        if (g_fetchFailCount >= FETCH_FAIL_RESTART_THRESHOLD) {
+          LOG_ERROR("API unreachable for %d attempts, restarting", g_fetchFailCount);
+          ESP.restart();
+        }
       }
+      uint32_t retryMs = backoffMs(max(g_fetchFailCount, (uint8_t)1));
+      g_nextFetchAt = millis() + retryMs;
+      LOG_WARN("Fetch failed (attempt %d), next retry in %lu ms", g_fetchFailCount, (unsigned long)retryMs);
       // Stale-data end of life: stop showing a flight we can't refresh
       if (g_haveDisplayed && (millis() - g_lastDataMs) > STALE_DISPLAY_MAX_MS) {
         LOG_WARN("Displayed data stale > %lu ms, clearing", (unsigned long)STALE_DISPLAY_MAX_MS);

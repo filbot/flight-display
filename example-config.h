@@ -31,14 +31,13 @@
 #define RELAY_IN3_PIN 26
 #define RELAY_IN4_PIN 27
 
-// Optional: explicit role mapping (uncomment and adjust to match wiring)
+// Optional: explicit role mapping (uncomment and adjust to match wiring).
+// These are the sketch defaults: STATUS=IN1, PVT=IN2, COM=IN3, MIL=IN4.
 // #define RELAY_STATUS_PIN RELAY_IN1_PIN
-// #define RELAY_COM_PIN    RELAY_IN2_PIN
-// #define RELAY_PVT_PIN    RELAY_IN3_PIN
+// #define RELAY_PVT_PIN    RELAY_IN2_PIN
+// #define RELAY_COM_PIN    RELAY_IN3_PIN
 // #define RELAY_MIL_PIN    RELAY_IN4_PIN
 // #define RELAY_ACTIVE_HIGH 0      // 0 for active-LOW boards, 1 for active-HIGH
-// #define RELAY_BLINK_ON_BOOT 0    // 1 to blink status during boot
-// #define RELAY_USE_STATUS_CHANNEL 1 // 0 to disable dedicated status channel
 
 // --- OTA (ArduinoOTA) ---
 // Set FEATURE_OTA to 1 to enable over-the-air updates.
