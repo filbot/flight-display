@@ -753,10 +753,12 @@ static FlightInfo parseClosest(JsonVariant root) {
   // Trim trailing whitespace
   for (int i = strlen(res.ident) - 1; i >= 0 && res.ident[i] == ' '; --i) res.ident[i] = '\0';
 
-  // alt_baro is a number in feet, or the string "ground" for surface aircraft
-  if (obj["alt_baro"].isNull()) res.altitudeFt = -1;
-  else if (obj["alt_baro"].is<const char*>()) res.altitudeFt = ALT_GROUND;
-  else res.altitudeFt = obj["alt_baro"].as<int32_t>();
+  // alt_baro is a number in feet, or the string "ground" for surface aircraft.
+  // Some targets (MLAT/TIS-B, some GA) omit alt_baro — fall back to alt_geom.
+  if (obj["alt_baro"].is<const char*>()) res.altitudeFt = ALT_GROUND;
+  else if (!obj["alt_baro"].isNull()) res.altitudeFt = obj["alt_baro"].as<int32_t>();
+  else if (!obj["alt_geom"].isNull()) res.altitudeFt = obj["alt_geom"].as<int32_t>();
+  else res.altitudeFt = -1;
 
   // "t" = aircraft type designator (B738, A320, etc.)
   // Note: "type" is a different field (message type: adsb_icao, tisb, mlat) — do NOT use as fallback
@@ -834,6 +836,7 @@ static FetchResult fetchNearestFlight(FlightInfo &out) {
   acObj["hex"] = true;
   acObj["t"] = true;
   acObj["alt_baro"] = true;
+  acObj["alt_geom"] = true;  // fallback when alt_baro is absent
   acObj["lat"] = true;
   acObj["lon"] = true;
   acObj["seen_pos"] = true;

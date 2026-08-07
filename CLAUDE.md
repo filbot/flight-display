@@ -62,7 +62,7 @@ Control Relays (status=ON, exactly one category relay ON)
 - **Base**: `https://api.adsb.lol`
 - **Endpoint**: `GET /v2/closest/{lat}/{lon}/{radius}` — returns nearest aircraft
 - **MIL endpoint**: `GET /v2/mil` — all military aircraft (used for cache misses)
-- **Fields used**: `hex`, `flight`, `r`, `t`, `alt_baro`, `lat`, `lon`, `seen_pos`, `category`, `dbFlags`, `desc` (title fallback for unknown types)
+- **Fields used**: `hex`, `flight`, `r`, `t`, `alt_baro`, `alt_geom` (fallback when `alt_baro` absent), `lat`, `lon`, `seen_pos`, `category`, `dbFlags`, `desc` (title fallback for unknown types)
 - **Fields available but unused**: `gs` (ground speed), `track`, `geom_rate`, `nav_altitude_mcp`, `emergency`, `type` (message type — never use as a `t` fallback), `ownOp` (operator)
 
 ## Coding Conventions
