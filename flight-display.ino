@@ -208,6 +208,13 @@ static constexpr uint32_t MIL_LOOKUP_HARD_TIMEOUT_MS = 15000;  // absolute wall-
 #define PIXEL_SHIFT_INTERVAL_MS (3UL * 60UL * 1000UL)  // 3 minutes per step
 #endif
 
+// Wider search radius tried only when the primary radius is empty, so the
+// display always shows the nearest aircraft when anything is in range.
+// Costs one extra API call per cycle only while the primary circle is quiet.
+#ifndef SEARCH_RADIUS_FALLBACK_KM
+#define SEARCH_RADIUS_FALLBACK_KM 100
+#endif
+
 // Exponential backoff with jitter for retry logic
 static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 60000) {
   uint32_t exp = base << min((uint8_t)attempt, (uint8_t)5);
@@ -795,13 +802,18 @@ static FlightInfo parseClosest(JsonVariant root) {
   return res;
 }
 
-static FetchResult fetchNearestFlight(FlightInfo &out) {
+static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
   if (WiFi.status() != WL_CONNECTED) return FETCH_FAIL;
+
+  // The API's radius parameter is NAUTICAL MILES (verified against its dst
+  // field) — convert so the *_KM config constants mean what they say
+  int radiusNm = (int)(radiusKm * 0.5399568 + 0.5);
+  if (radiusNm < 1) radiusNm = 1;
 
   // Build URL with stack-allocated buffer (no heap allocation)
   char url[128];
   snprintf(url, sizeof(url), "%s/v2/closest/%.6f/%.6f/%d",
-           API_BASE, HOME_LAT, HOME_LON, SEARCH_RADIUS_KM);
+           API_BASE, HOME_LAT, HOME_LON, radiusNm);
   LOG_INFO("HTTP GET %s", url);
   LOG_DEBUG("WiFi RSSI: %d dBm", WiFi.RSSI());
   LOG_DEBUG("Free heap: %u", (unsigned)ESP.getFreeHeap());
@@ -879,6 +891,19 @@ static FetchResult fetchNearestFlight(FlightInfo &out) {
   return FETCH_EMPTY;
 }
 
+// Primary radius first; widen only when the nearby sky is empty, so the
+// display always has an aircraft when anything is in range while keeping
+// the common case at one API call per cycle.
+static FetchResult fetchNearestFlight(FlightInfo &out) {
+  FetchResult fr = fetchClosestAt(SEARCH_RADIUS_KM, out);
+  if (fr == FETCH_EMPTY && SEARCH_RADIUS_FALLBACK_KM > SEARCH_RADIUS_KM) {
+    LOG_INFO("Nothing within %d km, widening to %d km",
+             (int)SEARCH_RADIUS_KM, (int)SEARCH_RADIUS_FALLBACK_KM);
+    fr = fetchClosestAt(SEARCH_RADIUS_FALLBACK_KM, out);
+  }
+  return fr;
+}
+
 // test server removed
 
 // Resolve display title: local table -> pseudo targets (TIS-B, MLAT, etc.)
@@ -934,7 +959,8 @@ static uint8_t pixelShiftIdx() {
 // Draw the bottom metric bar: distance | seats | altitude
 static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) {
   char distStr[16] = "\xE2\x80\x94";  // em-dash
-  if (!isnan(fi.distanceKm)) snprintf(distStr, sizeof(distStr), "%.1fkm", fi.distanceKm);
+  // Internally everything stays km (API radius, haversine); convert at render only
+  if (!isnan(fi.distanceKm)) snprintf(distStr, sizeof(distStr), "%.1fmi", fi.distanceKm * 0.621371);
 
   char seatsStr[8] = "\xE2\x80\x94";
   if (!isPseudo) {

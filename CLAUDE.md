@@ -60,7 +60,8 @@ Control Relays (status=ON, exactly one category relay ON)
 ## API
 
 - **Base**: `https://api.adsb.lol`
-- **Endpoint**: `GET /v2/closest/{lat}/{lon}/{radius}` — returns nearest aircraft
+- **Endpoint**: `GET /v2/closest/{lat}/{lon}/{radius}` — returns nearest aircraft. **The radius parameter is nautical miles**, not km — the firmware converts `SEARCH_RADIUS_KM` (real km) to nm when building the URL.
+- **Tiered search**: primary `SEARCH_RADIUS_KM` circle first; only if empty, one extra call at `SEARCH_RADIUS_FALLBACK_KM` (default 100) so the display always shows the nearest aircraft when anything is in range.
 - **MIL endpoint**: `GET /v2/mil` — all military aircraft (used for cache misses)
 - **Fields used**: `hex`, `flight`, `r`, `t`, `alt_baro`, `alt_geom` (fallback when `alt_baro` absent), `lat`, `lon`, `seen_pos`, `category`, `dbFlags`, `desc` (title fallback for unknown types)
 - **Fields available but unused**: `gs` (ground speed), `track`, `geom_rate`, `nav_altitude_mcp`, `emergency`, `type` (message type — never use as a `t` fallback), `ownOp` (operator)

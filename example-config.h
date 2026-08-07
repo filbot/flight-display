@@ -7,10 +7,14 @@
 #define WIFI_SSID "SSID"
 #define WIFI_PASSWORD "PASSWORD"
 
-// Location and search radius (km)
+// Location and search radius (real kilometers — converted to the API's
+// nautical-mile parameter internally)
 #define HOME_LAT 00.0000
 #define HOME_LON -000.0000
 #define SEARCH_RADIUS_KM 10
+// Wider radius tried only when the primary circle is empty, so the display
+// always shows the nearest aircraft when anything is in range
+// #define SEARCH_RADIUS_FALLBACK_KM 100
 
 // API base (https enabled)
 #define API_BASE "https://api.adsb.lol"
