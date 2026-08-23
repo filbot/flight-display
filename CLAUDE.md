@@ -30,6 +30,9 @@ Display driver: `U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI` with full framebuffer.
 | `tools/monitor.sh` | Detached soak monitor: serial capture + 60s `/healthz` poll into gitignored `logs/` |
 | `tools/report.py` | Summarizes a soak run: reboots, heap drift, Wi-Fi, fetch mix, no-data stretches |
 | `tools/harness.py` | Injects display edge cases via `PUT /test/closest`; `soak` mode cycles them unattended |
+| `tools/mockapi.py` | Faithful local HTTPS replica of api.adsb.lol: real routes, honours lat/lon/radius against a synthetic fleet, reproduces the UA-403 / 429 / keep-alive quirks, logs every request |
+| `tools/flows.py` | Whole-flow tests asserted on what the device *requested* (radius conversion, tiered fallback, UA, override TTL, empty-clears) |
+| `tools/with-device-lock.sh` | Mutex every device driver must go through — two at once corrupt each other |
 
 ## Build
 
@@ -63,7 +66,7 @@ Control Relays (status=ON, exactly one category relay ON)
 
 - **Base**: `https://api.adsb.lol`
 - **Endpoint**: `GET /v2/closest/{lat}/{lon}/{radius}` — returns nearest aircraft. **The radius parameter is nautical miles**, not km — the firmware converts `SEARCH_RADIUS_KM` (real km) to nm when building the URL.
-- **Tiered search**: primary `SEARCH_RADIUS_KM` circle first; only if empty, one extra call at `SEARCH_RADIUS_FALLBACK_KM` (default 100) so the display always shows the nearest aircraft when anything is in range.
+- **Tiered search** (verified by `tools/flows.py`: requests 5 nm then 54 nm): primary `SEARCH_RADIUS_KM` circle first; only if empty, one extra call at `SEARCH_RADIUS_FALLBACK_KM` (default 100) so the display always shows the nearest aircraft when anything is in range.
 - **MIL endpoint**: `GET /v2/mil` exists but is **deliberately unused**. Every aircraft it returns already carries `dbFlags` bit 0, and the API omits `dbFlags` entirely when it would be zero, so the list cannot add information the closest response has not already given. Verified over 802 aircraft across 4 regions: `dbFlags` never appears as an explicit 0, and all 7 aircraft with bit 0 set were in the mil list. Do not reintroduce a scan of it.
 - **Fields used**: `hex`, `flight`, `r`, `t`, `alt_baro`, `alt_geom` (fallback when `alt_baro` absent), `lat`, `lon`, `seen_pos`, `category`, `dbFlags`, `desc` (title fallback for unknown types)
 - **Fields available but unused**: `gs` (ground speed), `track`, `geom_rate`, `nav_altitude_mcp`, `emergency`, `type` (message type — never use as a `t` fallback), `ownOp` (operator)

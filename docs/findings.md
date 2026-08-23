@@ -6,6 +6,42 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## API surface we are not using (2026-08-23 survey)
+
+Sampled 131 live aircraft via `/v2/point`. We consume 12 fields; the response
+carries ~40. Percentages are how often the field was actually present, which is
+the thing that decides whether a feature is worth building.
+
+**Worth taking, in order:**
+
+| Field | Present | Why it matters |
+|---|---|---|
+| `dst` | 100% | The API already returns distance **in nautical miles from the query point** — exactly the number we render. Adopting it deletes `haversineKm()` and `deg2rad()` outright. The cheapest win here: less code, not more. |
+| `squawk` + `emergency` | 96% / 95% | Squawk 7500 (hijack), 7600 (radio failure), 7700 (general emergency), and an explicit `emergency` string. A genuinely striking thing for a display to surface, and it costs one comparison. |
+| `dir` | 100% | Bearing from the query point. On a display next to a window, "which way do I look" is arguably better than distance. |
+| `gs` | 100% | Ground speed in knots — a natural third metric for the bottom bar. |
+| `baro_rate` / `geom_rate` | 62% / 35% | Vertical rate: a climb/descent arrow next to the altitude. Note the coverage gap; needs a fallback to blank. |
+| `seen` | 100% | Age of the *whole record*, where `seen_pos` is only the position's age. A cheap extra staleness guard. |
+| `mlat` / `tisb` | 100% (arrays) | Non-empty means the position is multilaterated or TIS-B rebroadcast rather than direct ADS-B — i.e. less trustworthy. Relevant given how much we care about position trust. |
+
+**Endpoints we do not call** (all verified live): `/v2/hex/{hex}`,
+`/v2/reg/{reg}`, `/v2/callsign/{cs}`, `/v2/type/{t}`, `/v2/sqk/{sqk}`,
+`/v2/point/{lat}/{lon}/{r}` (all aircraft in a radius, not just the nearest),
+`/v2/ladd`, `/v2/pia`. `/v2/point` is the interesting one: it would allow "3
+aircraft overhead" or picking the most *interesting* aircraft rather than merely
+the closest.
+
+**Not worth it:** `nic`, `rc`, `sil`, `sda`, `gva`, `nac_p`, `nac_v`,
+`version`, `nic_baro` are ADS-B integrity/accuracy metadata with no display
+value. `ias`/`tas`/`mach`/`roll`/`wd`/`ws` are present on under 1% of aircraft.
+
+**Operational note:** the real API rate-limits at roughly **1 request/second** —
+a rapid endpoint sweep earns `429`s. The device's 30s interval is far inside
+that, but test scripts must pace themselves. This is a further argument for
+testing against `tools/mockapi.py` rather than the live API.
+
+---
+
 ## 2026-08-23 morning: three fixes applied
 
 Prioritised by measurement rather than by the severity labels, which the data
