@@ -117,7 +117,7 @@ Examples:
   | 2 | `nordo` | 7600 | `RADIO FAIL 7600` |
   | 1 | `lifeguard` | — | `LIFEGUARD` |
 
-  `selectAircraft()` lets an alerting aircraft preempt the nearest one: **severity beats proximity**, and distance only separates aircraft at the same severity. `ALERT_PREEMPT_MIN_PRIORITY` (default 1, so everything shows) raises the bar if medical flights prove too frequent. The banner occupies **only** the type-name area — **the bottom row must never change**, its three cells (distance | seats | altitude) are physically labelled on the display bezel.
+  `selectAircraft()` lets an alerting aircraft preempt the nearest one: **severity beats proximity**, and distance only separates aircraft at the same severity. While an alert shows, the whole panel is **inverted** (`ALERT_INVERT_DISPLAY`, default on) by XOR-filling the framebuffer — nothing moves, so the bottom row still aligns with the bezel labels and only the polarity changes. `ALERT_PREEMPT_MIN_PRIORITY` (default 1, so everything shows) raises the bar if medical flights prove too frequent. The banner occupies **only** the type-name area — **the bottom row must never change**, its three cells (distance | seats | altitude) are physically labelled on the display bezel.
 - **Relay mapping**: Status=IN1, PVT=IN2, COM=IN3, MIL=IN4 (configurable via `RELAY_*_PIN`)
 - **Test override**: `PUT /test/closest` with JSON body to inject test flight data (5-min TTL)
 - **Health**: `GET /healthz` returns JSON telemetry (uptime, reset reason, heap free/min/largest-block, RSSI, fetch ok/empty/fail counters, last HTTP status and error body, last-data age, what's on screen, dim state). `GET /` stays plain `OK`.

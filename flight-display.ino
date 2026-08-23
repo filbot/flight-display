@@ -87,6 +87,13 @@ static const AlertLevel kAlerts[] = {
 // Only conditions at or above this priority take over the display from the
 // nearest aircraft. Default 1 shows everything, lifeguard included; raise it if
 // medical flights prove too frequent to be interesting.
+// Invert the whole panel while an alert is showing, so it is unmissable from
+// across the room. Costs OLED lifetime while lit — acceptable because alerts
+// are rare and brief, but worth knowing if one ever loiters.
+#ifndef ALERT_INVERT_DISPLAY
+#define ALERT_INVERT_DISPLAY 1
+#endif
+
 #ifndef ALERT_PREEMPT_MIN_PRIORITY
 #define ALERT_PREEMPT_MIN_PRIORITY 1
 #endif
@@ -1341,6 +1348,14 @@ static void renderFlight(const FlightInfo &fi) {
     u8g2.setFont(bottomFont);
     int16_t d2 = u8g2.getDescent();
     drawBottomBar(fi, isPseudo, SCREEN_HEIGHT - 1 - (d2 < 0 ? -d2 : d2));
+#if ALERT_INVERT_DISPLAY
+    // XOR the whole framebuffer: lit background, dark text. Nothing moves, so
+    // the bottom row still lines up with the labels on the bezel — only the
+    // polarity changes. Draw colour 2 is u8g2's XOR mode.
+    u8g2.setDrawColor(2);
+    u8g2.drawBox(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+    u8g2.setDrawColor(1);
+#endif
     u8g2.sendBuffer();
     return;
   }

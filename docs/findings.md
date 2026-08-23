@@ -113,6 +113,17 @@ the two sources disagree the more severe wins (squawk 7600 plus status
 `unlawful` renders `HIJACK 7500`). `ALERT_PREEMPT_MIN_PRIORITY` raises the
 preempt bar if medical flights turn out to be too common to be interesting.
 
+While an alert is showing the whole panel is inverted (`ALERT_INVERT_DISPLAY`),
+XOR-filled so nothing shifts position — the bottom row keeps its three cells and
+its alignment with the bezel labels, and only the polarity changes. Reviewed live
+across all seven states before being kept.
+
+Trade-off accepted deliberately: an inverted panel lights most of its pixels,
+which runs against the 60%-brightness change made for panel life. Alerts are rare
+and brief so the aggregate cost is negligible, but a long-loitering emergency
+would hold the panel lit. If that ever matters, blinking between normal and
+inverted would be both more noticeable and half the lit time.
+
 Verified: flows 13/13, faults 10/10, display harness 24/24.
 
 ## 2026-08-23: emergency squawk feature
