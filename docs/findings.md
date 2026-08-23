@@ -6,6 +6,43 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## Overnight result, 2026-08-23 05:00–14:00 UTC (9h, 13 full passes)
+
+Stability was clean. Everything below either confirms the 23:30 findings or is new.
+
+- **No firmware faults found overnight.** 13 complete passes: fault suite 10/10
+  every time, display harness 15/15 every time, 724 probe case-runs. Zero
+  crashes, zero watchdog trips, zero circuit-breaker restarts, zero
+  heap-critical restarts. The only two reboots were my own OTA flashes.
+- **No heap leak.** Half-vs-half drift +65 bytes over 538 samples; largest block
+  constant at 110580. Min-ever dipped to 119852 under fault load, still 8x the
+  15000 critical threshold.
+- **Wi-Fi rock solid**: RSSI −47/−43/−41 dBm, zero samples with the link down,
+  1 unreachable health sample in 538 (0.2%) and it coincides with an OTA flash.
+- **NEW, finding #11 below**: real-world fetch latency has a much longer tail
+  than the p95 suggested — 15 of 2796 requests exceeded 9s, with a real
+  api.adsb.lol request reaching **14.46s and still returning 200**.
+- The 7 probe failures (1% of runs) were a **defect in my test harness, not the
+  firmware** — see "Test artifacts" below. Re-verified deterministic 6/6.
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 11 | medium | Connect and read timeouts are **separate 8s budgets**, so one fetch can legitimately block `loop()` for ~16s; observed max 14.46s against the real API, returning 200. That leaves only ~10s of margin under the 25s task watchdog. Anyone lowering `LOOP_WDT_TIMEOUT_S`, raising the HTTP timeouts, or adding a second blocking call to the fetch cycle must re-check this margin. | open |
+
+### Test artifacts (not firmware defects)
+
+- 7 of 724 probe runs failed across 6 cases, each returning **exactly the previous
+  case's value**. Root cause was in `tools/probe.py`: the baseline fetch counter
+  was built from *three separate* `health()` HTTP calls, so a fetch landing
+  between them corrupted the baseline, the wait loop fell through, and the probe
+  sampled stale state. Fixed to a single sample; `pos_no_seenpos`, the flakiest
+  case at 2/15, then passed 6/6. No firmware behaviour was implicated.
+- Three altitude cases (`alt_huge`, `alt_numstring`, `alt_geom_only`) looked wrong
+  in the first pass on 2026-08-22 for the same reason and were cleared on
+  isolated re-run.
+
+---
+
 ## Night of 2026-08-22 → 23: full logic and data-path sweep
 
 Method: every parse/classify branch driven with a crafted payload through a local

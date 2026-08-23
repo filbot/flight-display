@@ -122,7 +122,11 @@ def run_case(name, body, expect, why, mock):
         f.write(body)
     # Re-PUT the same base to reset g_nextFetchAt and force an immediate fetch,
     # so a case costs ~4s instead of a full 30s cycle.
-    before = health().get("fetch_ok", 0) + health().get("fetch_empty", 0) + health().get("fetch_fail", 0)
+    # One sample, not three: calling health() three times let a fetch land
+    # between the calls, corrupting the baseline so the wait below fell through
+    # and sampled the previous case's result (~1% of runs overnight).
+    _h0 = health()
+    before = _h0.get("fetch_ok", 0) + _h0.get("fetch_empty", 0) + _h0.get("fetch_fail", 0)
     req("PUT", "/test/apibase", {"base": mock})
     # Wait for a fetch to actually complete against this payload, otherwise the
     # first case reads whatever the previous (live) fetch left on screen.
