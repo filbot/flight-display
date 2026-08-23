@@ -6,6 +6,50 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-23 22:00 UTC: Wi-Fi reconnect path — finally tested
+
+Two AP experiments failed to disassociate the device (the router was cycled, not
+the access point), so the path was tested directly instead with a new
+`POST /test/wifi-drop` hook: it disables auto-reconnect, drops the association,
+and holds it down for a self-expiring interval. `tools/wifitest.py` triggers it,
+waits out the outage it cannot poll through, then reconstructs events from the
+serial log and the uptime counter. **9/9 checks passed.**
+
+Confirmed working:
+
+- Association really dropped (`WiFi disconnected. Reason: 8`), stayed down for
+  the full hold, and `connectWiFi()` — not the SDK — brought it back.
+- **Reconnect took 2 seconds**: hold expired 22:01:47, `WiFi.begin()` the same
+  second, `Got IP` at 22:01:49, first successful fetch at 22:01:53.
+- No reboot (uptime 31s -> 147s continuous), no crash, no watchdog trip.
+- The circuit breaker correctly stayed silent. `g_fetchFailCount` is only
+  incremented when `WiFi.status() == WL_CONNECTED`, so a Wi-Fi outage can never
+  trip a breaker meant for "API unreachable while the link is up".
+- Fetches while the link is down **fail instantly** — the `WiFi.status()` guard
+  at the top of `fetchClosestAt()` returns before any DNS work, so finding #14's
+  15-second DNS stall does *not* apply to Wi-Fi outages. Only to internet ones.
+
+### New finding
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 15 | low | **No backoff during a Wi-Fi outage.** Because `g_fetchFailCount` is deliberately frozen while the link is down, `backoffMs()` is always called with 1 and the retry interval stays pinned at ~4.3s — observed 16 times in a 90s hold, every one logging `Fetch failed (attempt 0)`. Each attempt is instant so there is no real cost, but it produces ~840 log lines an hour and, once the display has cleared, ~840 full-framebuffer splash redraws an hour. Contrast with an API outage, where backoff correctly grows to the 60s cap. | open |
+
+Suggested fix for #15: while `WiFi.status() != WL_CONNECTED`, do not treat the
+cycle as a fetch failure at all — reschedule at the normal `FETCH_INTERVAL_MS`.
+"We never tried" is not "we tried and failed", and it keeps the failure counter
+meaning one thing.
+
+### Still not covered
+
+The 60-second `WIFI_RETRY_INTERVAL_MS` cadence in `connectWiFi()`. The hook
+forces an immediate retry when the hold expires, and with a live AP the first
+`WiFi.begin()` always succeeds, so the periodic-retry branch never runs. Testing
+it needs an AP that is genuinely absent for several minutes.
+
+---
+
+
 ## 2026-08-23 21:21 UTC: AP restart — what it did and did not test
 
 **It did not exercise the Wi-Fi reconnect path.** The serial log (captured over

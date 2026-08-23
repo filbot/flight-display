@@ -361,6 +361,13 @@ static bool wifiConnecting = false;
 static bool wifiInitialized = false;
 static bool wifiEverBegun = false;
 static uint32_t wifiLastAttemptAt = 0;
+static uint32_t g_wifiDropUntil = 0;  // non-zero while a test drop is being held
+// Upper bound on a deliberate Wi-Fi drop. The device is unreachable while held
+// down, so the hold MUST self-expire — there is no way to call it back.
+#ifndef WIFI_DROP_MAX_MS
+#define WIFI_DROP_MAX_MS (10UL * 60UL * 1000UL)
+#endif
+
 #ifndef WIFI_RETRY_INTERVAL_MS
 #define WIFI_RETRY_INTERVAL_MS 60000  // retry WiFi.begin() every 60s if disconnected
 #endif
@@ -428,6 +435,7 @@ static void httpHandleHealth() {
   d["showing_flight"] = g_haveDisplayed;
   d["display_dim"] = g_displayDim;
   d["splash_active"] = g_splashActive;
+  d["wifi_drop_active"] = (g_wifiDropUntil != 0);
   d["splash_draws"] = g_statSplashDraws;
   d["shift_idx"] = pixelShiftIdx();
   d["alt_ft"] = g_lastShown.altitudeFt;
@@ -552,6 +560,32 @@ static void httpHandleDeleteApiBase() {
 // Deliberately wedge loop() so the task watchdog can be verified. An unverified
 // watchdog is worse than none — it looks like protection and may be misconfigured.
 // Blocks forever; the device should reboot after LOOP_WDT_TIMEOUT_S.
+// Deliberately drop the Wi-Fi association so the reconnect path can be tested
+// without touching the access point. Exercises the disconnect handler, the
+// behaviour of the fetch/display logic while the link is down, and recovery
+// through connectWiFi(). Auto-reconnect is disabled for the duration so that
+// OUR retry loop is what brings the link back, not the SDK's; the GOT_IP
+// handler re-enables it.
+static void httpHandleWifiDrop() {
+  uint32_t hold = 90000;
+  if (g_http.hasArg("plain")) {
+    StaticJsonDocument<128> doc;
+    if (!deserializeJson(doc, g_http.arg("plain")) && !doc["hold_ms"].isNull()) {
+      hold = doc["hold_ms"].as<uint32_t>();
+    }
+  }
+  if (hold > WIFI_DROP_MAX_MS) hold = WIFI_DROP_MAX_MS;
+  // Answer before the link goes away, or the caller never hears the reply.
+  g_http.send(200, "application/json",
+              String("{\"dropping_for_ms\":") + hold + "}");
+  g_http.client().flush();
+  delay(50);
+  g_wifiDropUntil = millis() + hold;
+  LOG_WARN("TEST: dropping Wi-Fi for %lu ms", (unsigned long)hold);
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect(false, false);
+}
+
 static void httpHandleHang() {
   LOG_ERROR("TEST: hanging loop() on purpose, expecting a watchdog reset");
   g_http.send(200, "text/plain", "hanging\n");
@@ -576,6 +610,7 @@ static void httpStartOnce() {
   g_http.on("/test/apibase", HTTP_PUT, httpHandlePutApiBase);
   g_http.on("/test/apibase", HTTP_DELETE, httpHandleDeleteApiBase);
   g_http.on("/test/hang", HTTP_POST, httpHandleHang);
+  g_http.on("/test/wifi-drop", HTTP_POST, httpHandleWifiDrop);
   g_http.begin();
   g_httpStarted = true;
   LOG_INFO("HTTP test server listening on :80");
@@ -1377,6 +1412,7 @@ void setup() {
         // Raise TX power after association; disable modem sleep for responsiveness
         WiFi.setTxPower(WIFI_RUN_TXPOWER);
         WiFi.setSleep(false);
+        WiFi.setAutoReconnect(true);  // may have been disabled by a test drop
         // Wi‑Fi up; print reminder of server endpoint
         Serial.println(F("[HTTP] Server ready on port 80"));
 #if FEATURE_OTA
@@ -1416,7 +1452,16 @@ void setup() {
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
+  if (g_wifiDropUntil && (int32_t)(millis() - g_wifiDropUntil) >= 0) {
+    g_wifiDropUntil = 0;
+    // Auto-reconnect stays off: connectWiFi() is now the only thing that can
+    // restore the link, which is exactly the path under test.
+    LOG_WARN("TEST: Wi-Fi hold expired, reconnect allowed");
+    wifiLastAttemptAt = millis() - WIFI_RETRY_INTERVAL_MS;  // retry immediately
+  }
+  // Everything else still runs while the link is held down, so the fetch,
+  // staleness and display paths are observed under a real disconnection.
+  if (WiFi.status() != WL_CONNECTED && !g_wifiDropUntil) {
     connectWiFi();
   }
 

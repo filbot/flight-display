@@ -33,6 +33,7 @@ Display driver: `U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI` with full framebuffer.
 | `tools/mockapi.py` | Faithful local HTTPS replica of api.adsb.lol: real routes, honours lat/lon/radius against a synthetic fleet, reproduces the UA-403 / 429 / keep-alive quirks, logs every request |
 | `tools/flows.py` | Whole-flow tests asserted on what the device *requested* (radius conversion, tiered fallback, UA, override TTL, empty-clears) |
 | `tools/with-device-lock.sh` | Mutex every device driver must go through — two at once corrupt each other |
+| `tools/wifitest.py` | Drops the Wi-Fi link via `POST /test/wifi-drop` and verifies the reconnect path from the serial log and uptime counter |
 
 ## Build
 
@@ -129,7 +130,8 @@ Examples:
 - ADS-B pads `flight` to 8 characters, so "no callsign" arrives as `"        "`, not as an empty string or an absent key. Test it with `hasNonSpace()`, never `*p` — padding otherwise wins the ident chain (blank title) and counts as a callsign (misclassifies PVT as COM).
 - Under the linked ArduinoJson **7.4.3**, `StaticJsonDocument<N>` is plain `JsonDocument`: `N` is ignored and allocation is on the heap. Responses above ~3.6 KB fail to parse as `EmptyInput` regardless of `N`; unreachable today because `/v2/closest` returns one aircraft.
 - - `dbFlags` is **absent**, not zero, for non-military aircraft — the API omits the key entirely. `FlightInfo.dbFlags` uses -1 for absent, so test `dbFlags >= 0 && (dbFlags & 1)`; treating absence as unknown rather than as a negative is what previously justified the redundant `/v2/mil` scan.
-- `WiFi.setAutoReconnect(true)` handles most reconnects but has no backoff
+- `WiFi.setAutoReconnect(true)` handles most reconnects but has no backoff. Neither does the fetch loop while the link is down: `g_fetchFailCount` is frozen (so the circuit breaker cannot misfire), which also pins the retry interval at ~4.3s — see finding #15.
+- Test a Wi-Fi outage with `tools/wifitest.py`, not by touching the AP. Two attempts to disassociate the device by power-cycling network gear failed because the radio stayed up; only `POST /test/wifi-drop` reliably drops the association.
 - The Arduino core initializes the task watchdog (5s, panic) but **never subscribes `loopTask`**, so a wedged `loop()` hangs forever by default. `setup()` now reconfigures it to `LOOP_WDT_TIMEOUT_S` (25s) and subscribes. Any new blocking I/O in `loop()` must either finish inside that window or call `esp_task_wdt_reset()` as it works, like the MIL scan does.
 - HTTP timeouts are sized from measured latency (p50 957ms / p95 1270ms over 428 live fetches), not guessed. Keep them well under `LOOP_WDT_TIMEOUT_S` or a slow API will look like a hang and reboot the device.
 - `client.setInsecure()` — no TLS cert verification (standard for ESP32 IoT)
