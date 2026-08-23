@@ -49,6 +49,18 @@ CASES = [
      "all-empty payload degrades gracefully, no blank/garbage screen"),
     ("longident", dict(ident="ABCDEFGHIJKLMNOP", t="B738", alt=30000, dist=15.0, seats=189),
      "over-long ident truncated, not overflowed"),
+    # Emergency banner: replaces ONLY the type-name area. The bottom row is
+    # physically labelled on the bezel, so distance|seats|altitude must stay put.
+    ("sq_7700",   dict(ident="UAL123", t="B738", alt=31000, dist=12.0, seats=189, squawk="7700"),
+     "banner 'EMERGENCY 7700' over 'UAL123 B738'; bottom row unchanged"),
+    ("sq_7600",   dict(ident="AAL456", t="A320", alt=18000, dist=7.5, seats=186, squawk="7600"),
+     "banner 'RADIO FAIL 7600'; bottom row unchanged"),
+    ("sq_7500",   dict(ident="DAL789", t="B77W", alt=35000, dist=22.0, seats=396, squawk="7500"),
+     "banner 'HIJACK 7500'; bottom row unchanged"),
+    ("sq_normal", dict(ident="SWA100", t="B738", alt=30000, dist=9.0, seats=189, squawk="1200"),
+     "ordinary squawk: normal type name, no banner"),
+    ("sq_long",   dict(ident="LONGCALLSIGN99", t="B77W", alt=41000, dist=99.9, seats=396, squawk="7700"),
+     "long ident on the banner must not overflow 256px"),
 ]
 
 

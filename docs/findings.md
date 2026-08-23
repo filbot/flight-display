@@ -6,6 +6,37 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-23: emergency squawk feature
+
+The primary search moved from `/v2/closest` to `/v2/point`, so the firmware now
+sees every aircraft in the circle instead of only the nearest. `selectAircraft()`
+picks the nearest aircraft as before, except that an aircraft squawking 7500,
+7600 or 7700 anywhere in the circle preempts it — that is the entire reason for
+fetching the whole list.
+
+The widened fallback deliberately stays on `/v2/closest`: it only fires when the
+nearby sky is empty, and then the only question is "nearest thing anywhere",
+which 591 B answers as well as 44 KB would.
+
+Display: the banner replaces **only** the type-name area. The bottom row is
+untouched by design — its three cells are physically labelled on the display
+bezel, so their meaning must never shift. Verified by feeding identical data with
+and without a 7700 and confirming the bottom-row inputs are byte-identical.
+
+Verified: `emergency_preempts` (7700 on the 8 km C172 beats a normal 3 km B738),
+`normal_squawk_ignored` (ordinary code changes nothing), `uses_point_endpoint`
+(point for primary, closest for fallback), plus five display cases covering all
+three codes, an ordinary code, and an over-long callsign on the banner.
+
+**Test-side note:** switching endpoints broke three older flow tests that grepped
+for `/v2/closest/` to find the primary request — and one of them,
+`no_widen_when_found`, had been passing *vacuously* on an empty list rather than
+asserting anything. Both are fixed. Worth remembering that a test which stops
+matching reality can fail loudly or silently, and the silent one is worse.
+
+---
+
+
 ## 2026-08-23 evening: the response-size limit, investigated
 
 Finding #12 was real, not a mock artifact — it reproduced against a corrected,

@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-ESP32-based ADS-B flight tracker. Queries [adsb.lol](https://api.adsb.lol) every 30 seconds for the nearest aircraft within a configurable radius. Classifies each aircraft as **MIL** (military), **COM** (commercial), or **PVT** (private) using the API's `dbFlags` military bit, seat-count heuristics, and ADS-B category codes. Renders aircraft name, distance, seats, and altitude on a 256x64 SSD1322 OLED. Controls a 4-channel relay module (status + one per category).
+ESP32-based ADS-B flight tracker. Queries [adsb.lol](https://api.adsb.lol) every 30 seconds for **every** aircraft within a configurable radius and displays the nearest one — unless another is squawking an emergency, which takes precedence. Classifies each aircraft as **MIL** (military), **COM** (commercial), or **PVT** (private) using the API's `dbFlags` military bit, seat-count heuristics, and ADS-B category codes. Renders aircraft name, distance, seats, and altitude on a 256x64 SSD1322 OLED. Controls a 4-channel relay module (status + one per category).
 
 ## Hardware
 
@@ -66,6 +66,7 @@ Control Relays (status=ON, exactly one category relay ON)
 
 - **Base**: `https://api.adsb.lol`
 - **Endpoint**: `GET /v2/closest/{lat}/{lon}/{radius}` — returns nearest aircraft. **The radius parameter is nautical miles**, not km — the firmware converts `SEARCH_RADIUS_KM` (real km) to nm when building the URL.
+- **Endpoints**: the primary circle uses `GET /v2/point/{lat}/{lon}/{radius}` (all aircraft, ~2.6 KB at 10 km) so an emergency squawk on a non-nearest aircraft can be seen; the widened fallback stays on `/v2/closest` (591 B) because a 44 KB body buys nothing when the only question is "nearest thing anywhere".
 - **Tiered search** (verified by `tools/flows.py`: requests 5 nm then 54 nm): primary `SEARCH_RADIUS_KM` circle first; only if empty, one extra call at `SEARCH_RADIUS_FALLBACK_KM` (default 100) so the display always shows the nearest aircraft when anything is in range.
 - **MIL endpoint**: `GET /v2/mil` exists but is **deliberately unused**. Every aircraft it returns already carries `dbFlags` bit 0, and the API omits `dbFlags` entirely when it would be zero, so the list cannot add information the closest response has not already given. Verified over 802 aircraft across 4 regions: `dbFlags` never appears as an explicit 0, and all 7 aircraft with bit 0 set were in the mil list. Do not reintroduce a scan of it.
 - **Fields used**: `hex`, `flight`, `r`, `t`, `alt_baro`, `alt_geom` (fallback when `alt_baro` absent), `lat`, `lon`, `seen_pos`, `category`, `dbFlags`, `desc` (title fallback for unknown types)
@@ -104,6 +105,7 @@ Examples:
 - **Aircraft lookup**: Binary search on sorted, unique-key `kTypeInfo[]` by ICAO only (no IATA fallback — API `t` is always ICAO), then ~15 family-prefix heuristics. Unknown types fall back to the API `desc` field, then the raw code.
 - **Staleness**: Positions without fresh `seen_pos` are rejected. Displayed flight clears to splash after `STALE_DISPLAY_MAX_MS` (default 5 min) without a successful refresh; an empty-but-valid API response ("no aircraft nearby") clears immediately and doesn't count as a fetch failure.
 - **Display rendering**: Font cascade (32pt → 24pt → 20pt → 10pt → 9pt → 6pt) with 2-line word wrapping. Bottom bar: distance | seats | altitude in 3 equal cells.
+- **Emergency squawk**: 7500 (`HIJACK 7500`), 7600 (`RADIO FAIL 7600`), 7700 (`EMERGENCY 7700`). `selectAircraft()` lets the nearest *emergency* aircraft preempt the nearest aircraft overall. The banner occupies **only** the type-name area — **the bottom row must never change**, its three cells (distance | seats | altitude) are physically labelled on the display bezel.
 - **Relay mapping**: Status=IN1, PVT=IN2, COM=IN3, MIL=IN4 (configurable via `RELAY_*_PIN`)
 - **Test override**: `PUT /test/closest` with JSON body to inject test flight data (5-min TTL)
 - **Health**: `GET /healthz` returns JSON telemetry (uptime, reset reason, heap free/min/largest-block, RSSI, fetch ok/empty/fail counters, last HTTP status and error body, last-data age, what's on screen, dim state). `GET /` stays plain `OK`.

@@ -27,7 +27,7 @@ what the device actually asked for.
 Fault mode is read per-request from logs/mock.mode:
 
     ok empty http403 http429 http500 malformed truncated slow hang garbage
-    bigmil mil custom ratelimit uaenforce far
+    bigmil mil custom ratelimit uaenforce far emergency
 """
 import argparse, json, math, os, re, ssl, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -229,6 +229,10 @@ class Handler(BaseHTTPRequestHandler):
             inside.sort(key=lambda a: haversine_km(lat, lon, a["lat"], a["lon"]))
             if m == "empty":
                 inside = []
+            if m == "emergency":
+                # The 8 km C172 squawks 7700 while the 3 km B738 is normal, so a
+                # correct implementation shows the EMERGENCY one, not the nearest.
+                inside = [dict(a, squawk="7700") if a["t"] == "C172" else a for a in inside]
             if m == "mil":
                 # The military aircraft becomes the nearest, so /v2/closest
                 # exercises the dbFlags classification path.
@@ -258,6 +262,10 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/v2/mil":
             n = 4000 if m == "bigmil" else None
             mil = [a for a in FLEET if a.get("dbFlags", 0) & 1]
+            if m == "emergency":
+                # The 8 km C172 squawks 7700 while the 3 km B738 is normal, so a
+                # correct implementation shows the EMERGENCY one, not the nearest.
+                inside = [dict(a, squawk="7700") if a["t"] == "C172" else a for a in inside]
             if m == "mil":
                 mil = mil or [FLEET[-1]]
             if n:

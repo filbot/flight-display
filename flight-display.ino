@@ -48,6 +48,7 @@ struct FlightInfo {
   bool valid;
   int16_t seatOverride;    // if >0, override seat display
   int16_t dbFlags;         // adsb.lol dbFlags field; bit 0 = military
+  char squawk[8];          // transponder code; 7500/7600/7700 are emergencies
 
   FlightInfo() : altitudeFt(-1), lat(NAN), lon(NAN), distanceKm(NAN),
                  hasCallsign(false), valid(false), seatOverride(-1), dbFlags(-1) {
@@ -57,8 +58,19 @@ struct FlightInfo {
     desc[0] = '\0';
     hex[0] = '\0';
     opClass[0] = '\0';
+    squawk[0] = '\0';
   }
 };
+
+// The three internationally reserved emergency transponder codes. Returns the
+// label to show, or nullptr when the code is an ordinary one.
+static const char* emergencyLabel(const char* squawk) {
+  if (!squawk || !*squawk) return nullptr;
+  if (strcmp(squawk, "7500") == 0) return "HIJACK 7500";
+  if (strcmp(squawk, "7600") == 0) return "RADIO FAIL 7600";
+  if (strcmp(squawk, "7700") == 0) return "EMERGENCY 7700";
+  return nullptr;
+}
 // Local function prototypes used before definitions
 static void relaysPowerOnly();
 static void showSplash(const char *msgTop, const char *msgBottom = nullptr);
@@ -388,6 +400,11 @@ static void httpHandleHealth() {
   d["has_callsign"] = g_lastShown.hasCallsign;
   d["db_flags"] = g_lastShown.dbFlags;
   d["category"] = (const char*)g_lastShown.category;
+  d["squawk"] = (const char*)g_lastShown.squawk;
+  {
+    const char *al = emergencyLabel(g_lastShown.squawk);
+    d["emergency"] = al ? al : "";
+  }
   {
     char title[64];
     resolveFriendlyName(g_lastShown, title, sizeof(title));
@@ -444,6 +461,10 @@ static void httpHandlePutClosest() {
     fi.opClass[sizeof(fi.opClass) - 1] = '\0';
   }
   if (!doc["seats"].isNull()) fi.seatOverride = doc["seats"].as<int>();
+  if (!doc["squawk"].isNull()) {
+    strncpy(fi.squawk, doc["squawk"].as<const char*>(), sizeof(fi.squawk) - 1);
+    fi.squawk[sizeof(fi.squawk) - 1] = '\0';
+  }
   if (fi.opClass[0] == '\0') {
     strncpy(fi.opClass, (fi.seatOverride > 0 && fi.seatOverride <= 15) ? "PVT" : "COM", sizeof(fi.opClass) - 1);
     fi.opClass[sizeof(fi.opClass) - 1] = '\0';
@@ -605,6 +626,7 @@ static bool sameFlightDisplay(const FlightInfo &a, const FlightInfo &b) {
   if (strcmp(a.typeCode, b.typeCode) != 0) return false;
   if (a.altitudeFt != b.altitudeFt) return false;
   if (strcmp(a.opClass, b.opClass) != 0) return false;
+  if (strcmp(a.squawk, b.squawk) != 0) return false;
   // Consider distances equal within 0.1 km to avoid flicker
   double da = isnan(a.distanceKm) ? 0 : a.distanceKm;
   double db = isnan(b.distanceKm) ? 0 : b.distanceKm;
@@ -753,15 +775,8 @@ static bool extractLatLon(JsonObject obj, double &outLat, double &outLon) {
   return false;
 }
 
-static FlightInfo parseClosest(JsonVariant root) {
+static FlightInfo parseAircraft(JsonObject obj) {
   FlightInfo res;
-  if (!root.is<JsonObject>()) return res;
-  JsonObject robj = root.as<JsonObject>();
-  if (!robj.containsKey("ac") || !robj["ac"].is<JsonArray>()) return res;
-  JsonArray ac = robj["ac"].as<JsonArray>();
-  if (ac.size() == 0) return res;
-  JsonObject obj = ac[0].as<JsonObject>();
-
   double lat = NAN, lon = NAN;
   if (!extractLatLon(obj, lat, lon)) return res;
 
@@ -826,6 +841,9 @@ static FlightInfo parseClosest(JsonVariant root) {
   // dbFlags: bit 0 = military
   res.dbFlags = obj["dbFlags"].isNull() ? -1 : obj["dbFlags"].as<int>();
 
+  const char* sqSrc = obj["squawk"].isNull() ? nullptr : obj["squawk"].as<const char*>();
+  if (sqSrc) { strncpy(res.squawk, sqSrc, sizeof(res.squawk) - 1); res.squawk[sizeof(res.squawk) - 1] = '\0'; }
+
   res.valid = true;
   res.lat = lat;
   res.lon = lon;
@@ -885,7 +903,35 @@ class PatientStream : public Stream {
   bool timedOut_ = false;
 };
 
-static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
+// Choose which aircraft to show from a whole-response list.
+//
+// Normally that is simply the nearest one, which keeps the display identical to
+// the /v2/closest behaviour. The exception is an emergency transponder code:
+// 7500/7600/7700 anywhere in range preempts the nearest aircraft, because the
+// whole reason for fetching every aircraft in the circle is to notice one.
+// Among several emergencies the nearest wins.
+static FlightInfo selectAircraft(JsonVariant root) {
+  FlightInfo best;      // nearest valid aircraft
+  FlightInfo emerg;     // nearest valid aircraft squawking an emergency
+  if (!root.is<JsonObject>()) return best;
+  JsonObject robj = root.as<JsonObject>();
+  if (!robj.containsKey("ac") || !robj["ac"].is<JsonArray>()) return best;
+
+  for (JsonObject obj : robj["ac"].as<JsonArray>()) {
+    FlightInfo fi = parseAircraft(obj);
+    if (!fi.valid || isnan(fi.distanceKm)) continue;
+    if (!best.valid || fi.distanceKm < best.distanceKm) best = fi;
+    if (emergencyLabel(fi.squawk) && (!emerg.valid || fi.distanceKm < emerg.distanceKm)) emerg = fi;
+  }
+  if (emerg.valid) {
+    LOG_WARN("Emergency squawk %s on %s at %.1f km — preempting nearest",
+             emerg.squawk, emerg.ident, emerg.distanceKm);
+    return emerg;
+  }
+  return best;
+}
+
+static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAircraft = false) {
   if (WiFi.status() != WL_CONNECTED) return FETCH_FAIL;
 
   // The API's radius parameter is NAUTICAL MILES (verified against its dst
@@ -895,8 +941,12 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
 
   // Build URL with stack-allocated buffer (no heap allocation)
   char url[128];
-  snprintf(url, sizeof(url), "%s/v2/closest/%.6f/%.6f/%d",
-           g_apiBase, HOME_LAT, HOME_LON, radiusNm);
+  // /v2/point returns every aircraft in the circle, which is what lets an
+  // emergency squawk on a more distant aircraft preempt the nearest one.
+  // /v2/closest returns exactly one and stays the choice for the widened
+  // fallback search, where a 44 KB body would buy nothing over a 591 B one.
+  snprintf(url, sizeof(url), "%s/v2/%s/%.6f/%.6f/%d",
+           g_apiBase, allAircraft ? "point" : "closest", HOME_LAT, HOME_LON, radiusNm);
   LOG_INFO("HTTP GET %s", url);
   LOG_DEBUG("WiFi RSSI: %d dBm", WiFi.RSSI());
   LOG_DEBUG("Free heap: %u", (unsigned)ESP.getFreeHeap());
@@ -964,6 +1014,7 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
   acObj["seen_pos"] = true;
   acObj["category"] = true;
   acObj["dbFlags"] = true;  // bit 0 = military
+  acObj["squawk"] = true;   // 7500/7600/7700 are emergencies
   acObj["desc"] = true;     // full type description (title fallback)
 
   StaticJsonDocument<2048> doc;  // stack-allocated; filtered single-aircraft response is well under 1KB
@@ -979,7 +1030,7 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
     return FETCH_FAIL;
   }
 
-  FlightInfo closest = parseClosest(doc.as<JsonVariant>());
+  FlightInfo closest = selectAircraft(doc.as<JsonVariant>());
   if (closest.valid) {
     LOG_INFO("Closest %s  dist %.2f km", closest.ident, closest.distanceKm);
     const char* op = classifyOp(closest);
@@ -998,7 +1049,7 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
 // display always has an aircraft when anything is in range while keeping
 // the common case at one API call per cycle.
 static FetchResult fetchNearestFlight(FlightInfo &out) {
-  FetchResult fr = fetchClosestAt(SEARCH_RADIUS_KM, out);
+  FetchResult fr = fetchClosestAt(SEARCH_RADIUS_KM, out, /*allAircraft=*/true);
   if (fr == FETCH_EMPTY && SEARCH_RADIUS_FALLBACK_KM > SEARCH_RADIUS_KM) {
     LOG_INFO("Nothing within %d km, widening to %d km",
              (int)SEARCH_RADIUS_KM, (int)SEARCH_RADIUS_FALLBACK_KM);
@@ -1087,9 +1138,13 @@ static void renderFlight(const FlightInfo &fi) {
   u8g2.clearBuffer();
   u8g2.setDrawColor(1);
 
-  // 1) Top line: friendly aircraft name
+  // 1) Top line: friendly aircraft name, or the emergency banner when the
+  // aircraft is squawking 7500/7600/7700. The banner occupies the SAME area as
+  // the type name and nothing else moves — the bottom row is physically
+  // labelled on the bezel, so its three cells must never change meaning.
   char friendlyBuf[64];
   bool isPseudo = resolveFriendlyName(fi, friendlyBuf, sizeof(friendlyBuf));
+  const char *alert = emergencyLabel(fi.squawk);
 
   // Bottom metrics font (~50% larger than before)
   const uint8_t *bottomFont = u8g2_font_9x18_tf;  // was 6x12
@@ -1163,6 +1218,36 @@ static void renderFlight(const FlightInfo &fi) {
         break;
       }
     }
+  }
+
+  if (alert) {
+    // Line 1 names the condition, line 2 says which aircraft it is. Sized to fit
+    // rather than run through the wrap search, so the banner never re-flows.
+    char who[32];
+    snprintf(who, sizeof(who), "%s%s%s", fi.ident,
+             fi.typeCode[0] ? " " : "", fi.typeCode);
+    const uint8_t *alertFonts[] = { u8g2_font_logisoso20_tf, u8g2_font_10x20_tf,
+                                    u8g2_font_9x15_tf, u8g2_font_6x12_tf };
+    const uint8_t *aFont = alertFonts[3];
+    for (auto *f : alertFonts) {
+      u8g2.setFont(f);
+      int16_t lh = u8g2.getAscent() - u8g2.getDescent();
+      if (u8g2.getUTF8Width(alert) <= SCREEN_WIDTH
+          && u8g2.getUTF8Width(who) <= SCREEN_WIDTH
+          && 2 * lh + 2 <= topAvail) { aFont = f; break; }
+    }
+    u8g2.setFont(aFont);
+    int16_t asc = u8g2.getAscent(), desc = -u8g2.getDescent();
+    int16_t lh = asc + desc;
+    int16_t total = 2 * lh + 2;
+    int16_t y = (topAvail - total) / 2 + asc;
+    drawCentered(alert, y);
+    drawCentered(who, y + lh + 2);
+    u8g2.setFont(bottomFont);
+    int16_t d2 = u8g2.getDescent();
+    drawBottomBar(fi, isPseudo, SCREEN_HEIGHT - 1 - (d2 < 0 ? -d2 : d2));
+    u8g2.sendBuffer();
+    return;
   }
 
   // Draw title (one or two lines), vertically centered within topAvail

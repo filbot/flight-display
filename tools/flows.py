@@ -46,6 +46,18 @@ def set_mode(m):
         f.write(m)
 
 
+def search_reqs(rows):
+    """Aircraft-search requests, whichever endpoint served them.
+
+    The primary circle moved to /v2/point when the emergency-squawk feature
+    landed; the widened fallback stays on /v2/closest."""
+    return [r for r in rows if "/v2/point/" in r["path"] or "/v2/closest/" in r["path"]]
+
+
+def radius_of(r):
+    return int(r["path"].rstrip("/").split("/")[-1])
+
+
 def reqs_since(mark):
     out = []
     if not os.path.exists(REQ_LOG):
@@ -92,8 +104,8 @@ def t_radius_conversion(mock):
     c = health()
     force_fetch(mock)
     wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1)
-    got = [r for r in reqs_since(mark) if "/v2/closest/" in r["path"]]
-    radii = [int(r["path"].rstrip("/").split("/")[-1]) for r in got]
+    got = search_reqs(reqs_since(mark))
+    radii = [radius_of(r) for r in got]
     ok = bool(radii) and radii[0] == EXPECT_PRIMARY_NM
     check("radius_conversion", ok,
           f"requested radius {radii[:3]} nm, expected {EXPECT_PRIMARY_NM} "
@@ -107,8 +119,8 @@ def t_home_coords(mock):
     c = health()
     force_fetch(mock)
     wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1)
-    got = [r for r in reqs_since(mark) if "/v2/closest/" in r["path"]]
-    m = re.search(r"/v2/closest/(-?[\d.]+)/(-?[\d.]+)/", got[0]["path"]) if got else None
+    got = search_reqs(reqs_since(mark))
+    m = re.search(r"/v2/(?:closest|point)/(-?[\d.]+)/(-?[\d.]+)/", got[0]["path"]) if got else None
     ok = bool(m) and abs(float(m.group(1)) - 47.6506) < 1e-4 and abs(float(m.group(2)) + 122.3694) < 1e-4
     check("home_coords", ok, f"path {got[0]['path'] if got else 'none'}",
           "URL carries HOME_LAT/HOME_LON at full precision")
@@ -121,8 +133,8 @@ def t_tiered_fallback(mock):
     c = health()
     force_fetch(mock)
     h = wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1, timeout=90)
-    got = [r for r in reqs_since(mark) if "/v2/closest/" in r["path"]]
-    radii = [int(r["path"].rstrip("/").split("/")[-1]) for r in got]
+    got = search_reqs(reqs_since(mark))
+    radii = [radius_of(r) for r in got]
     widened = EXPECT_FALLBACK_NM in radii
     ok = widened and radii[:1] == [EXPECT_PRIMARY_NM] and h.get("showing_flight")
     check("tiered_fallback", ok,
@@ -139,9 +151,10 @@ def t_no_widen_when_found(mock):
     c = health()
     force_fetch(mock)
     wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1)
-    got = [r for r in reqs_since(mark) if "/v2/closest/" in r["path"]]
-    radii = [int(r["path"].rstrip("/").split("/")[-1]) for r in got]
-    ok = EXPECT_FALLBACK_NM not in radii
+    got = search_reqs(reqs_since(mark))
+    radii = [radius_of(r) for r in got]
+    # bool(radii) matters: an empty list would otherwise pass this vacuously
+    ok = bool(radii) and EXPECT_FALLBACK_NM not in radii
     check("no_widen_when_found", ok, f"radii requested {radii[:4]}",
           "a populated primary circle must cost exactly one API call")
 
@@ -193,6 +206,56 @@ def t_empty_clears(mock):
     set_mode("ok")
 
 
+def t_emergency_preempts(mock):
+    """An emergency squawk anywhere in the circle outranks the nearest aircraft.
+
+    The mock puts 7700 on the 8 km C172 while a normal B738 sits at 3 km, so a
+    correct implementation shows the C172 — the whole point of fetching every
+    aircraft rather than just the closest one."""
+    set_mode("emergency")
+    c = health()
+    force_fetch(mock)
+    h = wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1, timeout=90)
+    ok = h.get("squawk") == "7700" and h.get("emergency") == "EMERGENCY 7700" \
+        and h.get("type") == "C172"
+    check("emergency_preempts", ok,
+          f"showing type={h.get('type')!r} ident={h.get('ident')!r} "
+          f"squawk={h.get('squawk')!r} banner={h.get('emergency')!r} "
+          f"dist={h.get('dist_km')}",
+          "7700 on a farther aircraft beats a normal nearer one")
+    set_mode("ok")
+
+
+def t_normal_squawk_ignored(mock):
+    """An ordinary squawk must change nothing — the nearest aircraft still wins."""
+    set_mode("ok")
+    c = health()
+    force_fetch(mock)
+    h = wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1, timeout=90)
+    ok = h.get("emergency") == "" and h.get("type") == "B738"
+    check("normal_squawk_ignored", ok,
+          f"showing type={h.get('type')!r} squawk={h.get('squawk')!r} "
+          f"banner={h.get('emergency')!r}",
+          "ordinary squawk leaves the nearest-aircraft behaviour untouched")
+
+
+def t_uses_point_endpoint(mock):
+    """The primary search must use /v2/point; the fallback must stay /v2/closest."""
+    set_mode("far")  # empty primary forces the widened fallback too
+    mark = req_count()
+    c = health()
+    force_fetch(mock)
+    wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1, timeout=90)
+    got = [r["path"] for r in reqs_since(mark) if "/v2/" in r["path"]]
+    primary = [p for p in got if "/point/" in p]
+    fallback = [p for p in got if "/closest/" in p]
+    ok = bool(primary) and bool(fallback)
+    check("uses_point_endpoint", ok,
+          f"point requests {len(primary)}, closest requests {len(fallback)}; {got[:3]}",
+          "primary circle uses /v2/point, widened fallback stays on /v2/closest")
+    set_mode("ok")
+
+
 def t_recovers(mock):
     set_mode("ok")
     c = health()
@@ -219,6 +282,7 @@ def main():
     req("PUT", "/test/apibase", {"base": mock})
     time.sleep(4)
     for t in (t_radius_conversion, t_home_coords, t_tiered_fallback, t_no_widen_when_found,
+              t_uses_point_endpoint, t_emergency_preempts, t_normal_squawk_ignored,
               t_user_agent, t_override_ttl, t_empty_clears, t_recovers):
         try:
             t(mock)
