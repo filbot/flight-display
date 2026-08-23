@@ -6,6 +6,44 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-23 21:21 UTC: AP restart — what it did and did not test
+
+**It did not exercise the Wi-Fi reconnect path.** The serial log (captured over
+USB, so unaffected by the network) shows **no `WiFi disconnected` event** during
+the outage: the device kept its association throughout. `connectWiFi()`,
+`WIFI_RETRY_INTERVAL_MS` and the disconnect handler never ran. What actually
+happened was a ~2 minute loss of internet/DNS with the Wi-Fi link up.
+
+That is still a realistic and common failure, and the firmware handled it well:
+
+- 4 consecutive failed fetches, backoff 4.3s -> 8s -> 16.3s -> 36s, then a clean
+  200 at 21:23:08. Total outage 21:21:04 -> 21:23:10, about 2m06s.
+- **No reboot**: uptime ran continuously 1944s -> 2074s across the event.
+- Circuit breaker correctly did not fire (4 failures against a threshold of 60).
+- Display correctly kept the last aircraft rather than clearing: the outage was
+  ~2 min against `STALE_DISPLAY_MAX_MS` of 5 min.
+- `fail_streak` returned to 0 and heap was unaffected.
+
+### New finding
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 14 | medium | A fetch that cannot resolve DNS blocks `loop()` for **exactly 15.003s**, four times out of four — nearly double `HTTP_CONNECT_TIMEOUT_MS` (8s), because lwIP's DNS resolution happens inside `http.begin()` and is not covered by that timeout. Successful fetches take 0.9-1.3s. This is the *common* real-world failure (internet down, Wi-Fi up), not a corner case, and it leaves only ~10s of margin under the 25s task watchdog. During each 15s window OTA and the HTTP server are unresponsive. | open |
+
+Mitigations worth considering for #14: cache the resolved address and reuse it
+when resolution fails, resolve explicitly via `WiFi.hostByName()` with a shorter
+bounded timeout, or accept it and keep `LOOP_WDT_TIMEOUT_S` comfortably above 15s
+(it is, at 25s — but the margin is smaller than the 8s config implies).
+
+### Still owed
+
+A real Wi-Fi disassociation test. It needs the AP **off for 3+ minutes**, or the
+device carried out of range, so the link genuinely drops and the reconnect loop
+runs. A quick restart is not enough — the association survived this one.
+
+---
+
+
 ## 2026-08-23: alert feature (squawk codes + emergency status)
 
 Extended beyond the three transponder codes to the ADS-B emergency/priority
