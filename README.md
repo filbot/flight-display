@@ -71,11 +71,15 @@ Returns the closest aircraft object with fields like:
   "lon": -73.782
 }
 
-### Optional MIL classification
+### MIL classification
 
-To detect military aircraft the device can query `/v2/mil` once per new hex and cache the result for several hours.
-- Toggle at compile time with `#define FEATURE_MIL_LOOKUP 0/1` (default: 1).
-- If disabled, MIL classification is inferred only from type/seat heuristics.
+Military aircraft are detected from the API's `dbFlags` bit 0, which arrives on
+the normal `/v2/closest` response. No extra request is made.
+
+The device used to scan `/v2/mil` for cache misses. That was removed: every
+aircraft in that list already carries `dbFlags` bit 0, and the API omits the
+field entirely when it would be zero, so the scan cost ~24 KB and a ~1s stall
+per new aircraft to re-derive something already known.
 
 ### Local Test Endpoint
 

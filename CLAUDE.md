@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-ESP32-based ADS-B flight tracker. Queries [adsb.lol](https://api.adsb.lol) every 30 seconds for the nearest aircraft within a configurable radius. Classifies each aircraft as **MIL** (military), **COM** (commercial), or **PVT** (private) using military API lookup, seat-count heuristics, and ADS-B category codes. Renders aircraft name, distance, seats, and altitude on a 256x64 SSD1322 OLED. Controls a 4-channel relay module (status + one per category).
+ESP32-based ADS-B flight tracker. Queries [adsb.lol](https://api.adsb.lol) every 30 seconds for the nearest aircraft within a configurable radius. Classifies each aircraft as **MIL** (military), **COM** (commercial), or **PVT** (private) using the API's `dbFlags` military bit, seat-count heuristics, and ADS-B category codes. Renders aircraft name, distance, seats, and altitude on a 256x64 SSD1322 OLED. Controls a 4-channel relay module (status + one per category).
 
 ## Hardware
 
@@ -46,7 +46,7 @@ WiFi Connect → API Fetch (adsb.lol /v2/closest)
     ↓
 JSON Parse (streamed, filtered) → FlightInfo struct
     ↓
-Classify (dbFlags → MIL cache → seat heuristics → category → callsign)
+Classify (dbFlags → seat heuristics → category → callsign)   [no network I/O]
     ↓
 Render on OLED (dynamic font sizing, 1-2 line title + 3 bottom cells)
     ↓
@@ -57,7 +57,6 @@ Control Relays (status=ON, exactly one category relay ON)
 
 **Feature flags** (compile-time, overridable in config.h):
 - `FEATURE_OTA` (default 1) — ArduinoOTA updates
-- `FEATURE_MIL_LOOKUP` (default 1) — Military aircraft detection via `/v2/mil`
 - `FEATURE_TEST_ENDPOINT` (default 1) — Test HTTP server on port 80
 
 ## API
@@ -65,7 +64,7 @@ Control Relays (status=ON, exactly one category relay ON)
 - **Base**: `https://api.adsb.lol`
 - **Endpoint**: `GET /v2/closest/{lat}/{lon}/{radius}` — returns nearest aircraft. **The radius parameter is nautical miles**, not km — the firmware converts `SEARCH_RADIUS_KM` (real km) to nm when building the URL.
 - **Tiered search**: primary `SEARCH_RADIUS_KM` circle first; only if empty, one extra call at `SEARCH_RADIUS_FALLBACK_KM` (default 100) so the display always shows the nearest aircraft when anything is in range.
-- **MIL endpoint**: `GET /v2/mil` — all military aircraft (used for cache misses)
+- **MIL endpoint**: `GET /v2/mil` exists but is **deliberately unused**. Every aircraft it returns already carries `dbFlags` bit 0, and the API omits `dbFlags` entirely when it would be zero, so the list cannot add information the closest response has not already given. Verified over 802 aircraft across 4 regions: `dbFlags` never appears as an explicit 0, and all 7 aircraft with bit 0 set were in the mil list. Do not reintroduce a scan of it.
 - **Fields used**: `hex`, `flight`, `r`, `t`, `alt_baro`, `alt_geom` (fallback when `alt_baro` absent), `lat`, `lon`, `seen_pos`, `category`, `dbFlags`, `desc` (title fallback for unknown types)
 - **Fields available but unused**: `gs` (ground speed), `track`, `geom_rate`, `nav_altitude_mcp`, `emergency`, `type` (message type — never use as a `t` fallback), `ownOp` (operator)
 
@@ -98,8 +97,7 @@ Examples:
 
 ## Key Patterns
 
-- **Classification priority**: dbFlags military bit → MIL cache lookup → seat count (≤15 = PVT) → ADS-B category (runs whenever seats didn't classify) → callsign presence (has callsign = COM, else PVT)
-- **MIL cache**: 16-entry array, 6h positive / 1h negative TTL, fixed `char[8]` hex keys. An incomplete `/v2/mil` scan (timeout/stall) reports failure, never "not military".
+- **Classification priority**: dbFlags military bit → seat count (≤15 = PVT) → ADS-B category (runs whenever seats didn't classify) → callsign presence (has callsign = COM, else PVT). `classifyOp()` does no network I/O at all.
 - **Aircraft lookup**: Binary search on sorted, unique-key `kTypeInfo[]` by ICAO only (no IATA fallback — API `t` is always ICAO), then ~15 family-prefix heuristics. Unknown types fall back to the API `desc` field, then the raw code.
 - **Staleness**: Positions without fresh `seen_pos` are rejected. Displayed flight clears to splash after `STALE_DISPLAY_MAX_MS` (default 5 min) without a successful refresh; an empty-but-valid API response ("no aircraft nearby") clears immediately and doesn't count as a fetch failure.
 - **Display rendering**: Font cascade (32pt → 24pt → 20pt → 10pt → 9pt → 6pt) with 2-line word wrapping. Bottom bar: distance | seats | altitude in 3 equal cells.
@@ -112,7 +110,7 @@ Examples:
 
 - `SCREEN_WIDTH` defaults to 128 in .ino but config.h overrides to 256 — always check config.h
 - Display is rotated 180° (`U8G2_R2`) — (0,0) is bottom-right of physical display
-- The `/v2/mil` endpoint returns ALL military aircraft globally (~25 KB, `Content-Length` set, `Connection: keep-alive`) and blocks loop() for ~0.7s per scan. Use `dbFlags` first.
+- `dbFlags` is **absent**, not zero, for non-military aircraft — the API omits the key entirely. `FlightInfo.dbFlags` uses -1 for absent, so test `dbFlags >= 0 && (dbFlags & 1)`; treating absence as unknown rather than as a negative is what previously justified the redundant `/v2/mil` scan.
 - `WiFi.setAutoReconnect(true)` handles most reconnects but has no backoff
 - The Arduino core initializes the task watchdog (5s, panic) but **never subscribes `loopTask`**, so a wedged `loop()` hangs forever by default. `setup()` now reconfigures it to `LOOP_WDT_TIMEOUT_S` (25s) and subscribes. Any new blocking I/O in `loop()` must either finish inside that window or call `esp_task_wdt_reset()` as it works, like the MIL scan does.
 - HTTP timeouts are sized from measured latency (p50 957ms / p95 1270ms over 428 live fetches), not guessed. Keep them well under `LOOP_WDT_TIMEOUT_S` or a slow API will look like a hang and reboot the device.
@@ -123,7 +121,7 @@ Examples:
 - adsb.lol returns **403 with body `User-Agent too generic; include valid contact info.`** for anonymous-looking clients. `API_USER_AGENT` must carry a real email or project URL and is set in `config.h` (gitignored). The same request from a laptop can return 200 while the device gets 403, so don't test this with curl alone — read the device's own error body.
 - Non-2xx API responses: always log `http.getString()` (bounded). The status code alone hid this 403's cause completely.
 - `arduino-cli monitor` **exits immediately when stdin is not a TTY**, so it cannot be used for detached/background logging. Read the port directly, holding the fd open with `exec 3<>` so the `stty` settings survive (each fresh open resets the port to 9600 on macOS).
-- **`stream.available() == 0` is NOT end-of-stream.** Over TLS the body arrives in bursts and the buffer drains between them. Breaking the read loop on `!available()` truncated every `/v2/mil` scan at ~4 KB of 25 KB. Loop until `Content-Length` (`http.getSize()`) is satisfied; treat only *closed connection + empty buffer* as EOF, with a wall-clock timeout as the bound.
+- **`stream.available() == 0` is NOT end-of-stream.** Over TLS the body arrives in bursts and the buffer drains between them. Breaking the read loop on `!available()` truncated every `/v2/mil` scan at ~4 KB of 25 KB (that scan has since been deleted, but the lesson applies to any streamed body). Loop until `Content-Length` (`http.getSize()`) is satisfied; treat only *closed connection + empty buffer* as EOF, with a wall-clock timeout as the bound.
 - Conversely, **`client.connected()` stays true after a complete body** when the server keeps the connection alive, so it cannot be used to detect a clean end either.
 - Raw serial capture contains non-printable boot-ROM bytes, which makes `grep` treat `logs/serial.log` as binary and print *nothing* for patterns that are present. `tools/monitor.sh` now squashes them on write; for older logs use `grep -a`.
 - **Opening the USB serial port reboots the board** (DTR toggle). A reset logged at the moment a monitor attaches is an artifact, not a fault. USB flashing and serial logging contend for the port — stop the logger or flash via OTA.

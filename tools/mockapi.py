@@ -21,6 +21,7 @@ can change behaviour mid-flight without restarting the server. Modes:
     hang        accepts, sends nothing, never closes
     garbage     200 with binary junk
     bigmil      /v2/mil returns a very large body
+    mil         aircraft with dbFlags=1, must classify as MIL
 """
 import argparse, json, os, ssl, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -101,6 +102,12 @@ class Handler(BaseHTTPRequestHandler):
             # Content-Length promises the whole body; the client must notice the
             # stream ended early rather than parsing whatever arrived.
             return self._send(200, cut, clen=len(body))
+        if m == "mil":
+            # dbFlags bit 0 is the only military signal the firmware has left,
+            # so this is the regression test for removing the /v2/mil scan.
+            return self._send(200, json.dumps(
+                {"ac": [dict(AIRCRAFT, hex="ae057b", flight="RCH8099 ",
+                             t="C5M", dbFlags=1)], "total": 1}))
         if m == "empty":
             return self._send(200, json.dumps({"ac": [], "total": 0}))
         return self._send(200, json.dumps({"ac": [AIRCRAFT], "total": 1, "now": time.time()}))

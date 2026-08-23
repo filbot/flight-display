@@ -64,6 +64,8 @@ def scenarios(fail_wait):
         ("malformed", fail_wait, fails_grew, "unparseable JSON is a failure, not a crash"),
         ("garbage", fail_wait, fails_grew, "binary junk does not corrupt or crash"),
         ("truncated", fail_wait, fails_grew, "short body vs Content-Length is rejected"),
+        ("mil", 90, lambda b: (lambda h: h["op"] == "MIL"),
+         "dbFlags=1 alone classifies MIL (no /v2/mil scan exists any more)"),
         ("empty", fail_wait, lambda b: (lambda h: h["fetch_empty"] > b["fetch_empty"]),
          "empty sky clears the display without counting a failure"),
         ("slow", 90, fails_grew, "slow response hits the read timeout and recovers"),

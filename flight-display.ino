@@ -173,9 +173,6 @@ static void relaysShowCategory(const char* opClass) {
 #define SCREEN_HEIGHT 64
 #endif
 
-#ifndef FEATURE_MIL_LOOKUP
-#define FEATURE_MIL_LOOKUP 1
-#endif
 
 // SPI OLED (SSD1322) via U8g2, full framebuffer, HW SPI (rotated 180°)
 U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI u8g2(U8G2_R2, PIN_CS, PIN_DC, PIN_RST);
@@ -188,7 +185,6 @@ static constexpr uint32_t FETCH_INTERVAL_MS = 30000;        // 30s between API c
 // bounding a stall to well under the watchdog period.
 static constexpr uint32_t HTTP_CONNECT_TIMEOUT_MS = 8000;  // HTTP connect timeout
 static constexpr uint32_t HTTP_READ_TIMEOUT_MS = 8000;     // HTTP read timeout
-static constexpr uint32_t MIL_LOOKUP_HARD_TIMEOUT_MS = 15000;  // absolute wall-clock limit for /v2/mil streaming
 
 // Heap monitoring thresholds
 #ifndef HEAP_WARN_THRESHOLD
@@ -289,7 +285,6 @@ static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 
 // Lifetime counters for the health endpoint — cheap, and the only way to see
 // slow drift (failure ratio, empty-sky ratio) over a multi-day soak.
 static uint32_t g_statOk = 0, g_statEmpty = 0, g_statFail = 0;
-static uint32_t g_statMilOk = 0, g_statMilIncomplete = 0;
 static int g_statLastHttp = 0;
 static char g_statErrBuf[96] = "";
 static const char *g_statLastErr = "";
@@ -322,20 +317,6 @@ static uint32_t wifiLastAttemptAt = 0;
 static bool g_otaReady = false;        // true after ArduinoOTA.begin while Wi‑Fi has IP
 static volatile bool g_inOta = false;  // set during OTA to pause app work
 #endif
-
-// MIL cache — uses fixed char arrays to avoid heap allocation
-static constexpr uint32_t MIL_CACHE_TTL_POS = 6UL * 60UL * 60UL * 1000UL;  // 6h for confirmed results
-static constexpr uint32_t MIL_CACHE_TTL_NEG = 1UL * 60UL * 60UL * 1000UL;  // 1h for a confirmed negative
-static constexpr uint32_t MIL_CACHE_TTL_UNKNOWN = 5UL * 60UL * 1000UL;    // 5m when the lookup itself failed
-struct MilCacheEntry {
-  char hex[8];    // ICAO hex is always 6 chars + null
-  uint32_t ts;
-  uint32_t ttl;   // per-entry TTL (positive vs negative cache)
-  bool isMil;
-  bool valid;
-};
-static constexpr size_t MIL_CACHE_SIZE = 16;
-static MilCacheEntry g_milCache[MIL_CACHE_SIZE];  // BSS zero-init; .valid=false gates access
 
 // Flight info structure used across network parsing, test overrides, and rendering
 // (struct FlightInfo defined earlier)
@@ -384,8 +365,6 @@ static void httpHandleHealth() {
   d["fetch_empty"] = g_statEmpty;
   d["fetch_fail"] = g_statFail;
   d["fail_streak"] = g_fetchFailCount;
-  d["mil_ok"] = g_statMilOk;
-  d["mil_incomplete"] = g_statMilIncomplete;
   d["last_http"] = g_statLastHttp;
   d["last_err"] = g_statLastErr;
   d["last_data_age_ms"] = g_lastDataMs ? (millis() - g_lastDataMs) : -1;
@@ -519,171 +498,6 @@ static void httpStartOnce() {
   LOG_INFO("HTTP test server listening on :80");
 }
 #endif
-static bool milCacheLookup(const char* hex, bool &isMilOut) {
-  if (!hex || !*hex) return false;
-  uint32_t now = millis();
-  for (size_t i = 0; i < MIL_CACHE_SIZE; ++i) {
-    if (g_milCache[i].valid && strcasecmp(g_milCache[i].hex, hex) == 0) {
-      // Rollover-safe: unsigned subtraction wraps correctly for intervals < 2^31
-      if ((now - g_milCache[i].ts) < g_milCache[i].ttl) {
-        isMilOut = g_milCache[i].isMil;
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-static void milCacheStore(const char* hex, bool isMil, uint32_t ttl = MIL_CACHE_TTL_POS) {
-  if (!hex || !*hex) return;
-  uint32_t now = millis();
-  // Update existing
-  for (size_t i = 0; i < MIL_CACHE_SIZE; ++i) {
-    if (g_milCache[i].valid && strcasecmp(g_milCache[i].hex, hex) == 0) {
-      g_milCache[i].isMil = isMil;
-      g_milCache[i].ts = now;
-      g_milCache[i].ttl = ttl;
-      return;
-    }
-  }
-  // Insert into first empty or oldest
-  size_t idx = 0;
-  uint32_t oldestAge = 0;
-  for (size_t i = 0; i < MIL_CACHE_SIZE; ++i) {
-    if (!g_milCache[i].valid) { idx = i; break; }
-    uint32_t age = now - g_milCache[i].ts;
-    if (age > oldestAge) { oldestAge = age; idx = i; }
-  }
-  strncpy(g_milCache[idx].hex, hex, sizeof(g_milCache[idx].hex) - 1);
-  g_milCache[idx].hex[sizeof(g_milCache[idx].hex) - 1] = '\0';
-  g_milCache[idx].isMil = isMil;
-  g_milCache[idx].ts = now;
-  g_milCache[idx].ttl = ttl;
-  g_milCache[idx].valid = true;
-}
-
-static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
-  isMilOut = false;
-  if (WiFi.status() != WL_CONNECTED || !hex || !*hex) return false;
-  char url[128];
-  snprintf(url, sizeof(url), "%s/v2/mil", g_apiBase);
-  LOG_INFO("HTTP GET %s", url);
-
-  HTTPClient http;
-  http.setReuse(false);
-  http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
-  http.setTimeout(HTTP_READ_TIMEOUT_MS);
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  if (!http.begin(client, url)) {
-    Serial.println("[HTTP] begin() failed (mil)");
-    return false;
-  }
-  http.addHeader("Accept", "application/json");
-  // setUserAgent, not addHeader: HTTPClient::addHeader silently DROPS
-  // User-Agent, Connection, Accept-Encoding and Host, so the addHeader version
-  // never left the device and adsb.lol saw the generic built-in UA and 403'd us.
-  http.setUserAgent(API_USER_AGENT);
-
-  int code = http.GET();
-  LOG_INFO("HTTP status (mil): %d", code);
-  if (code != HTTP_CODE_OK) {
-    http.end();
-    return false;
-  }
-
-  // Build needle: "hex":"abcdef"
-  char needle[32];
-  {
-    char lowerHex[8];
-    strncpy(lowerHex, hex, sizeof(lowerHex) - 1);
-    lowerHex[sizeof(lowerHex) - 1] = '\0';
-    for (char* p = lowerHex; *p; ++p) *p = tolower(*p);
-    snprintf(needle, sizeof(needle), "\"hex\":\"%s\"", lowerHex);
-  }
-  size_t needleLen = strlen(needle);
-
-  // Overlap buffer holds the tail of the previous chunk so that a needle
-  // spanning a chunk boundary is not missed.
-  char overlap[32] = "";
-  size_t overlapLen = 0;
-  const size_t CHUNK = 1024;
-  // Search buffer: overlap region + new chunk (allows cross-boundary matching)
-  char searchBuf[32 + CHUNK + 1];
-  char readBuf[CHUNK + 1];
-  // Absolute wall-clock timeout — never resets per chunk (rollover-safe subtraction)
-  uint32_t startTime = millis();
-  Stream &s = http.getStream();
-  // Content-Length decides completeness. adsb.lol answers /v2/mil with
-  // "Connection: keep-alive", so client.connected() stays true after the last
-  // byte — testing it marked every successful scan as a stall. Fall back to the
-  // connection test only when the length is unknown (chunked).
-  const int expected = http.getSize();
-  size_t totalRead = 0;
-  bool complete = false;  // true only if we reached a clean end-of-stream
-  while ((millis() - startTime) < MIL_LOOKUP_HARD_TIMEOUT_MS) {
-    if (expected >= 0 && totalRead >= (size_t)expected) {
-      complete = true;  // got every promised byte
-      break;
-    }
-    int n = s.readBytes(readBuf, CHUNK);
-    if (n <= 0) {
-      // available()==0 does NOT mean end-of-stream: over TLS the body arrives
-      // in bursts and the buffer drains between them. Treating it as EOF cut
-      // every scan short (~4 KB of a 24 KB body). Only a closed connection with
-      // an empty buffer is a real end; otherwise wait for the next burst and
-      // let the wall-clock timeout be the bound.
-      if (!client.connected() && !s.available()) {
-        complete = (expected >= 0) ? (totalRead >= (size_t)expected) : true;
-        break;
-      }
-      uint32_t waitStart = millis();
-      while (!s.available() && client.connected()
-             && (millis() - waitStart) < 50
-             && (millis() - startTime) < MIL_LOOKUP_HARD_TIMEOUT_MS) {
-        yield();  // cooperative, no blocking delay()
-      }
-      esp_task_wdt_reset();  // long but legitimate: keep the WDT period tight
-      continue;
-    }
-    totalRead += (size_t)n;
-    esp_task_wdt_reset();
-    // Lowercase the new data for case-insensitive matching
-    for (int j = 0; j < n; ++j) readBuf[j] = tolower(readBuf[j]);
-    readBuf[n] = '\0';
-    // Concatenate overlap + new chunk into searchBuf for cross-boundary matches
-    memcpy(searchBuf, overlap, overlapLen);
-    memcpy(searchBuf + overlapLen, readBuf, n + 1);  // includes '\0'
-    if (strstr(searchBuf, needle)) {
-      isMilOut = true;
-      http.end();
-      return true;
-    }
-    // Keep tail of new chunk as overlap for next iteration
-    if ((size_t)n >= needleLen) {
-      overlapLen = needleLen - 1;
-      memcpy(overlap, readBuf + n - overlapLen, overlapLen);
-    } else {
-      overlapLen = (size_t)n;
-      memcpy(overlap, readBuf, overlapLen);
-    }
-    overlap[overlapLen] = '\0';
-  }
-  http.end();
-  if (!complete) {
-    // Timed-out or stalled scan is NOT an authoritative "not military" —
-    // report failure so the caller caches it as unknown, not as a negative.
-    g_statMilIncomplete++;
-    LOG_WARN("MIL scan incomplete (read %u of %d bytes), result unknown",
-             (unsigned)totalRead, expected);
-    return false;
-  }
-  g_statMilOk++;
-  LOG_INFO("MIL scan complete (%u bytes), not military", (unsigned)totalRead);
-  return true;  // completed scan, not found => not mil
-}
-
 #if FEATURE_OTA
 static void otaBeginOnce() {
   if (g_otaReady) return;
@@ -734,46 +548,14 @@ static void otaBeginOnce() {
 
 // Shared display state so network and test endpoints can update consistently
 
-// Resolve military status via cache or network fetch. Must be called before
-// classifyOp() so the cache is populated. This is the only function that
-// performs blocking network I/O for classification.
-static void resolveMilitaryStatus(const FlightInfo &fi) {
-  if (!(FEATURE_MIL_LOOKUP && fi.hex[0])) return;
-  // Already in cache (positive or negative) — skip network
-  bool isMil = false;
-  if (milCacheLookup(fi.hex, isMil)) return;
-  // dbFlags already says military — cache it, skip network
-  if (fi.dbFlags >= 0 && (fi.dbFlags & 1)) {
-    milCacheStore(fi.hex, true, MIL_CACHE_TTL_POS);
-    return;
-  }
-  // Network fetch required
-  esp_task_wdt_reset();  // the closest fetch just finished; start the MIL scan fresh
-  bool ok = fetchIsMilitaryByHex(fi.hex, isMil);
-  if (ok) {
-    milCacheStore(fi.hex, isMil, isMil ? MIL_CACHE_TTL_POS : MIL_CACHE_TTL_NEG);
-  } else {
-    // A failed lookup is not evidence of anything. Cache "not military" just
-    // long enough to keep a broken /v2/mil from being re-scanned every cycle,
-    // then retry — the whole point of tracking completeness is lost if this
-    // gets the same hour-long TTL as an authoritative negative.
-    milCacheStore(fi.hex, false, MIL_CACHE_TTL_UNKNOWN);
-  }
-}
-
-// Pure classification — no network I/O. Relies on resolveMilitaryStatus()
-// having been called first to populate the MIL cache.
+// Pure classification — no network I/O at all.
 static const char* classifyOp(const FlightInfo &fi) {
-  // 1) dbFlags bit 0 = military (from API, avoids blocking /v2/mil call)
+  // 1) dbFlags bit 0 = military. Authoritative on its own: the API omits
+  // dbFlags entirely when it would be zero, and every aircraft returned by
+  // /v2/mil carries this bit, so scanning that list cannot add information.
   if (fi.dbFlags >= 0 && (fi.dbFlags & 1)) return "MIL";
 
-  // 2) MIL cache (populated by resolveMilitaryStatus)
-  if (fi.hex[0]) {
-    bool isMil = false;
-    if (milCacheLookup(fi.hex, isMil) && isMil) return "MIL";
-  }
-
-  // 3) Seat-based: small aircraft (<= 15 seats) are PVT
+  // 2) Seat-based: small aircraft (<= 15 seats) are PVT
   if (fi.typeCode[0]) {
     uint16_t maxSeats = 0;
     if (aircraftSeatMax(fi.typeCode, maxSeats)) {
@@ -781,7 +563,7 @@ static const char* classifyOp(const FlightInfo &fi) {
     }
   }
 
-  // 4) ADS-B category as supplementary signal when seats didn't classify
+  // 3) ADS-B category as supplementary signal when seats didn't classify
   // (unknown type, or a known type with no seat data e.g. freighters)
   if (fi.category[0]) {
     // A1=Light, A7=Rotorcraft → likely private
@@ -1070,8 +852,6 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
   FlightInfo closest = parseClosest(doc.as<JsonVariant>());
   if (closest.valid) {
     LOG_INFO("Closest %s  dist %.2f km", closest.ident, closest.distanceKm);
-    // Resolve military status (may do network I/O), then classify
-    resolveMilitaryStatus(closest);
     const char* op = classifyOp(closest);
     strncpy(closest.opClass, op, sizeof(closest.opClass) - 1);
     closest.opClass[sizeof(closest.opClass) - 1] = '\0';
