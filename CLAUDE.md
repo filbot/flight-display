@@ -114,6 +114,8 @@ Examples:
 - Display is rotated 180° (`U8G2_R2`) — (0,0) is bottom-right of physical display
 - The `/v2/mil` endpoint returns ALL military aircraft globally (~25 KB, `Content-Length` set, `Connection: keep-alive`) and blocks loop() for ~0.7s per scan. Use `dbFlags` first.
 - `WiFi.setAutoReconnect(true)` handles most reconnects but has no backoff
+- The Arduino core initializes the task watchdog (5s, panic) but **never subscribes `loopTask`**, so a wedged `loop()` hangs forever by default. `setup()` now reconfigures it to `LOOP_WDT_TIMEOUT_S` (25s) and subscribes. Any new blocking I/O in `loop()` must either finish inside that window or call `esp_task_wdt_reset()` as it works, like the MIL scan does.
+- HTTP timeouts are sized from measured latency (p50 957ms / p95 1270ms over 428 live fetches), not guessed. Keep them well under `LOOP_WDT_TIMEOUT_S` or a slow API will look like a hang and reboot the device.
 - `client.setInsecure()` — no TLS cert verification (standard for ESP32 IoT)
 - `alt_baro` is a number in feet OR the string `"ground"` — parsed to the `ALT_GROUND` sentinel (-2), rendered as `GND`
 - Duplicate ICAO variants (freighter/winglet) must NOT be added back to `kTypeInfo[]` — the `t` field can't distinguish them, and binary search requires unique sorted keys

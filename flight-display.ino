@@ -15,6 +15,7 @@
 #include <U8g2lib.h>
 #include <SPI.h>
 #include <WebServer.h>
+#include "esp_task_wdt.h"
 #if defined(ESP32)
 #include <esp_system.h>
 #endif
@@ -181,8 +182,12 @@ U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI u8g2(U8G2_R2, PIN_CS, PIN_DC, PIN_RST);
 
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;  // 20s
 static constexpr uint32_t FETCH_INTERVAL_MS = 30000;        // 30s between API calls
-static constexpr uint32_t HTTP_CONNECT_TIMEOUT_MS = 15000;  // HTTP connect timeout
-static constexpr uint32_t HTTP_READ_TIMEOUT_MS = 30000;     // HTTP read timeout
+// Sized from 428 measured live fetches: p50 957ms, p95 1270ms. The old 30s read
+// timeout was 23x p95, so a single stalled fetch froze loop() for half a minute
+// with OTA and the HTTP server unreachable. 8s keeps ~6x headroom over p95 while
+// bounding a stall to well under the watchdog period.
+static constexpr uint32_t HTTP_CONNECT_TIMEOUT_MS = 8000;  // HTTP connect timeout
+static constexpr uint32_t HTTP_READ_TIMEOUT_MS = 8000;     // HTTP read timeout
 static constexpr uint32_t MIL_LOOKUP_HARD_TIMEOUT_MS = 15000;  // absolute wall-clock limit for /v2/mil streaming
 
 // Heap monitoring thresholds
@@ -207,6 +212,13 @@ static constexpr uint32_t MIL_LOOKUP_HARD_TIMEOUT_MS = 15000;  // absolute wall-
 // Bottom-bar pixel shift interval (OLED image-sticking mitigation)
 #ifndef PIXEL_SHIFT_INTERVAL_MS
 #define PIXEL_SHIFT_INTERVAL_MS (3UL * 60UL * 1000UL)  // 3 minutes per step
+#endif
+
+// Task watchdog period. Must exceed the longest span loop() can go without a
+// feed: a closest fetch is connect(8s) + read(8s) worst case. The MIL scan is
+// longer but feeds from inside its own loop, so it does not set this floor.
+#ifndef LOOP_WDT_TIMEOUT_S
+#define LOOP_WDT_TIMEOUT_S 25
 #endif
 
 // Reset reason as text — printed at boot and served by /healthz, so a soak run
@@ -475,6 +487,16 @@ static void httpHandleDeleteApiBase() {
   g_http.send(200, "application/json", String("{\"base\":\"") + g_apiBase + "\"}");
 }
 
+// Deliberately wedge loop() so the task watchdog can be verified. An unverified
+// watchdog is worse than none — it looks like protection and may be misconfigured.
+// Blocks forever; the device should reboot after LOOP_WDT_TIMEOUT_S.
+static void httpHandleHang() {
+  LOG_ERROR("TEST: hanging loop() on purpose, expecting a watchdog reset");
+  g_http.send(200, "text/plain", "hanging\n");
+  for (;;) {
+  }
+}
+
 static void httpHandleDeleteClosest() {
   g_test.active = false;
   g_test.dirty = false;
@@ -491,6 +513,7 @@ static void httpStartOnce() {
   g_http.on("/test/closest", HTTP_DELETE, httpHandleDeleteClosest);
   g_http.on("/test/apibase", HTTP_PUT, httpHandlePutApiBase);
   g_http.on("/test/apibase", HTTP_DELETE, httpHandleDeleteApiBase);
+  g_http.on("/test/hang", HTTP_POST, httpHandleHang);
   g_http.begin();
   g_httpStarted = true;
   LOG_INFO("HTTP test server listening on :80");
@@ -621,9 +644,11 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
              && (millis() - startTime) < MIL_LOOKUP_HARD_TIMEOUT_MS) {
         yield();  // cooperative, no blocking delay()
       }
+      esp_task_wdt_reset();  // long but legitimate: keep the WDT period tight
       continue;
     }
     totalRead += (size_t)n;
+    esp_task_wdt_reset();
     // Lowercase the new data for case-insensitive matching
     for (int j = 0; j < n; ++j) readBuf[j] = tolower(readBuf[j]);
     readBuf[n] = '\0';
@@ -723,6 +748,7 @@ static void resolveMilitaryStatus(const FlightInfo &fi) {
     return;
   }
   // Network fetch required
+  esp_task_wdt_reset();  // the closest fetch just finished; start the MIL scan fresh
   bool ok = fetchIsMilitaryByHex(fi.hex, isMil);
   if (ok) {
     milCacheStore(fi.hex, isMil, isMil ? MIL_CACHE_TTL_POS : MIL_CACHE_TTL_NEG);
@@ -1269,6 +1295,19 @@ void setup() {
 #if defined(ESP32)
   Serial.print(F("[Boot] Reset reason: "));
   Serial.println(resetReasonStr());
+  // The Arduino core initializes the TWDT at 5s but only watches the idle task.
+  // Widen it and subscribe loopTask so a wedged loop() reboots instead of
+  // hanging silently forever on a 24/7 device.
+  {
+    esp_task_wdt_config_t wdt = {
+      .timeout_ms = LOOP_WDT_TIMEOUT_S * 1000,
+      .idle_core_mask = 0,
+      .trigger_panic = true,
+    };
+    esp_err_t re = esp_task_wdt_reconfigure(&wdt);
+    esp_err_t ad = esp_task_wdt_add(NULL);
+    LOG_INFO("Task WDT: %ds (reconfigure=%d add=%d)", LOOP_WDT_TIMEOUT_S, (int)re, (int)ad);
+  }
 #endif
   // Wi‑Fi event logging and dynamic power management
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -1333,6 +1372,8 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
+
+  esp_task_wdt_reset();
 
 #if FEATURE_TEST_ENDPOINT
   if (g_httpStarted) {
