@@ -160,6 +160,11 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass
         if "close" in self.headers.get("Connection", "").lower():
+            # Let a slow client drain a large body before the socket goes away.
+            # An abrupt close can discard data still in flight on a constrained
+            # TLS peer, which looks exactly like a parse failure at the client.
+            if len(raw) > 2048:
+                time.sleep(float(os.environ.get("MOCK_LINGER", "0.5")))
             self.close_connection = True
         self._record(code, note)
 

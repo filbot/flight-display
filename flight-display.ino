@@ -858,8 +858,9 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
 
   WiFiClientSecure client;
   client.setInsecure();
-  uint32_t clientTimeoutSec = (HTTP_READ_TIMEOUT_MS + 999) / 1000;
-  client.setTimeout(clientTimeoutSec);
+  // No client.setTimeout() here: HTTPClient::connect() sets the stream timeout
+  // from _tcpTimeout, and Stream::setTimeout takes MILLISECONDS while this once
+  // passed seconds — a discrepancy that looked like a bug and was merely dead.
   if (!http.begin(client, url)) {
     Serial.println("[HTTP] begin() failed (TLS)");
     return FETCH_FAIL;
@@ -915,6 +916,20 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
   acObj["desc"] = true;     // full type description (title fallback)
 
   StaticJsonDocument<2048> doc;  // stack-allocated; filtered single-aircraft response is well under 1KB
+  // The body can lag the headers. Above roughly 3.6 KB the response spans more
+  // than one TLS record, so at this point available() is 0 even though the data
+  // is milliseconds away (measured: 7221-byte body, avail 0 -> 7221 in 16ms).
+  // ArduinoJson's reader gives up on an empty stream and returns EmptyInput, so
+  // wait for the first byte before handing the stream over. Same failure family
+  // as the old /v2/mil scanner: "nothing buffered yet" is not "no data".
+  {
+    Stream &body = http.getStream();
+    uint32_t waitStart = millis();
+    while (body.available() == 0 && client.connected()
+           && (millis() - waitStart) < HTTP_READ_TIMEOUT_MS) {
+      yield();
+    }
+  }
   // Prefer streamed parsing to minimize RAM and fragmentation
   DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
   http.end();

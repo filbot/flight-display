@@ -6,6 +6,51 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-23 evening: the response-size limit, investigated
+
+Finding #12 was real, not a mock artifact — it reproduced against a corrected,
+faithful mock. Instrumenting the stream at the moment of parsing settled it:
+
+    len=3621  avail=3621  -> parses
+    len=7221  avail=0     -> EmptyInput ... yet avail=7221 just 16ms later
+
+Above roughly 3.6 KB the response spans more than one TLS record, so when the
+headers finish parsing the body has not landed yet. `available()` is 0,
+ArduinoJson's reader gives up, and the result is `EmptyInput`. **The same failure
+family as the old /v2/mil scanner:** "nothing buffered yet" is not "no data".
+
+### Fixed
+
+- `fetchClosestAt()` now waits (bounded by `HTTP_READ_TIMEOUT_MS`) for the first
+  body byte before handing the stream to ArduinoJson. The ceiling moved from
+  **~3.6 KB to ~14 KB**, a 4x improvement. Verified: 3621 B, 7221 B and 14421 B
+  all parse where the last two previously failed.
+- Removed a dead `client.setTimeout(clientTimeoutSec)` that passed **seconds**
+  into `Stream::setTimeout`, which takes milliseconds. It looked like a live bug
+  and was merely inert: `HTTPClient::connect()` overwrites the stream timeout
+  from `_tcpTimeout` immediately afterwards. Measured at runtime as 8000 ms.
+
+### Still open
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 13 | medium (blocks `/v2/point`) | Above ~14 KB the parse now fails as **`IncompleteInput`** rather than `EmptyInput` — a *mid-stream* gap, not a start-of-stream one. The first-byte wait cannot help; ArduinoJson stops when a read comes back short partway through the document. Fixing it needs a buffering/waiting `Stream` wrapper so a momentary TLS gap blocks instead of ending the document. | open |
+
+**Why #13 matters for product decisions:** `/v2/closest` returns ~700 B, so
+nothing today is affected. But switching to `/v2/point` to catch emergency
+squawks would pull every aircraft in the radius — roughly 7 KB at the 10 km
+primary radius (fine), but around **65 KB at the 100 km fallback radius**, well
+past the ceiling. So `/v2/point` is viable for the primary circle only until #13
+is fixed.
+
+**Upstream caveat noticed while reading the core:** `NetworkClient::readBytes()`
+computes its deadline as `int to = millis() + getTimeout()`. `millis()` exceeds
+`INT_MAX` after ~24.8 days, so the deadline arithmetic overflows on a long-lived
+device. Not ours to fix, but it sits directly on this device's 24/7 path and is
+worth knowing about alongside the 49.7-day `millis()` rollover.
+
+---
+
 ## API surface we are not using (2026-08-23 survey)
 
 Sampled 131 live aircraft via `/v2/point`. We consume 12 fields; the response
@@ -74,7 +119,7 @@ corrected in both directions.
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| 12 | low (unreachable) | Responses above roughly **3.6 KB fail to parse**, reported as `EmptyInput`. Bisected: 20 aircraft / 3621 B parses, 40 aircraft / 7221 B fails, with the mock verified to serve the body byte-identically. Not reachable in production — `/v2/closest` returns exactly one aircraft (~200 B), confirmed against the live API. Mechanism not established; it is **not** pool exhaustion, because under ArduinoJson 7 `StaticJsonDocument<2048>` is plain `JsonDocument` with a cosmetic `capacity()` and the 2048 is inert. | open |
+| 12 | low (unreachable, **partly fixed** — see the evening entry) | Responses above roughly **3.6 KB fail to parse**, reported as `EmptyInput`. Bisected: 20 aircraft / 3621 B parses, 40 aircraft / 7221 B fails, with the mock verified to serve the body byte-identically. Not reachable in production — `/v2/closest` returns exactly one aircraft (~200 B), confirmed against the live API. Mechanism not established; it is **not** pool exhaustion, because under ArduinoJson 7 `StaticJsonDocument<2048>` is plain `JsonDocument` with a cosmetic `capacity()` and the 2048 is inert. | open |
 
 Finding #10 is confirmed in more detail: the `<2048>` template argument has no
 effect at all under the linked 7.4.3, so both the size and the "stack-allocated,
