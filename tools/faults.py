@@ -69,8 +69,8 @@ def scenarios(fail_wait):
         ("empty", fail_wait, lambda b: (lambda h: h["fetch_empty"] > b["fetch_empty"]),
          "empty sky clears the display without counting a failure"),
         ("slow", 90, fails_grew, "slow response hits the read timeout and recovers"),
-        ("ok", 90, lambda b: (lambda h: h["fetch_ok"] > b["fetch_ok"]),
-         "recovers and shows a flight again after the fault clears"),
+        ("ok", 90, lambda b: (lambda h: h["fetch_ok"] > b["fetch_ok"] and not h.get("last_err")),
+         "recovers, and last_err clears instead of reporting a stale failure"),
     ]
 
 

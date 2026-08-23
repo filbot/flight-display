@@ -6,6 +6,74 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-23 morning: three fixes applied
+
+Prioritised by measurement rather than by the severity labels, which the data
+corrected in both directions.
+
+### Fixed
+
+- **#1 padding-only callsign** — ADS-B pads `flight` to 8 chars, so an aircraft
+  with no callsign arrived as `"        "`. `*identSrc` only rejects the empty
+  string, so padding won the ident chain: blank title, and `hasCallsign` went
+  true so a light aircraft classified COM and fired the wrong relay. Now tested
+  with `hasNonSpace()`, and leading padding is trimmed as well as trailing.
+  Measured rate first: **1 in 2002 live aircraft** (0.05%), so this was rarer
+  than its "high" label implied — fixed anyway because it blanks the display.
+  Regression cases `ident_ws_only`, `ident_ws_pvt`, `ident_lead_ws`.
+- **#2 stale `last_err`** — the field kept the last message that happened to
+  fail, so `/healthz` reported `Too Many Requests` beside a `200` indefinitely.
+  It had already misled this campaign's own reporting. Now cleared on every
+  attempt and populated for transport-level errors too. The fault suite's `ok`
+  scenario asserts it clears on recovery.
+- **#3 splash never pixel-shifted** — `pixelShiftIdx()` only re-rendered through
+  `renderFlight()`, so the splash was 100% static. Steady-state exposure is only
+  0.2% (the sky is rarely empty at 10 km), but during a sustained outage it is
+  100%, which is exactly the case the dimming was added for. `showSplash()` now
+  stores its text and `drawSplash()` applies the same offsets; `loop()` redraws
+  it on shift changes. Verified under a real outage: two distinct shift
+  positions with the redraw counter incrementing, dimmed throughout.
+
+### New finding
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 12 | low (unreachable) | Responses above roughly **3.6 KB fail to parse**, reported as `EmptyInput`. Bisected: 20 aircraft / 3621 B parses, 40 aircraft / 7221 B fails, with the mock verified to serve the body byte-identically. Not reachable in production — `/v2/closest` returns exactly one aircraft (~200 B), confirmed against the live API. Mechanism not established; it is **not** pool exhaustion, because under ArduinoJson 7 `StaticJsonDocument<2048>` is plain `JsonDocument` with a cosmetic `capacity()` and the 2048 is inert. | open |
+
+Finding #10 is confirmed in more detail: the `<2048>` template argument has no
+effect at all under the linked 7.4.3, so both the size and the "stack-allocated,
+no heap allocation" comments in `fetchClosestAt` are inaccurate.
+
+### Test artifacts found and fixed (not firmware defects)
+
+- `tools/probe.py` staged payloads with `open(BODY, "w")`, which truncates in
+  place; a fetch landing mid-write read an empty file and the firmware correctly
+  reported `EmptyInput`. Now an atomic `os.replace()`. This one masqueraded as a
+  firmware parse bug.
+- The fetch-counter barrier could be satisfied by an **in-flight fetch of the
+  previous payload**, so a case sampled the prior result. Replaced with a
+  sentinel barrier: stage a `SYNCPING` payload, wait until the device reports it,
+  then stage the real payload and wait until it moves off the sentinel.
+- **Concurrent test drivers.** `tools/overnight.sh` was still looping while
+  manual suites were run interactively. `probe.py`, `faults.py` and `harness.py`
+  all stage into the *same* `logs/mock.body` and all switch the device's
+  `api_base`, so two drivers at once read each other's payloads. This — not the
+  fetch barrier — is what produced 19 bogus "failures" in 51 cases on a build
+  that passes every case in isolation, and it also explains the single `garbage`
+  fault failure (overnight's pass-14 fault suite straddled two OTA flashes).
+  Fixed with `tools/with-device-lock.sh`, a mkdir-based mutex that every driver
+  now goes through. *An earlier version of this entry blamed the one-vs-two
+  fetch-completion barrier; that diagnosis was wrong.* The barrier was made
+  two-completion anyway, which is sound, but it was not the cause.
+- Both races together produced the 1% overnight flake rate. Worth recording that
+  **stale reads hid a real failure**: `bad_many_ac` appeared to pass all night
+  only because it was reading the previous case's success.
+- Lesson for this harness: every batch-mode probe failure so far has been the
+  harness, not the firmware, and each was only distinguishable by re-running the
+  case in isolation. Treat a batch failure as unproven until isolated.
+
+---
+
 ## Overnight result, 2026-08-23 05:00–14:00 UTC (9h, 13 full passes)
 
 Stability was clean. Everything below either confirms the 23:30 findings or is new.
@@ -55,9 +123,9 @@ serial + `/healthz` capture.
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| 1 | **high** | A `flight` field of only spaces (common in real ADS-B) yields an **empty ident** and is misclassified **COM**: `hasCallsign` is set from the untrimmed string, so padding counts as a callsign, and the `flight -> r -> hex` fallback never runs. Display shows a blank title where the callsign belongs. | open |
-| 2 | medium | `last_err` in `/healthz` is never cleared on success or on transport errors, so it reports a stale message indefinitely — observed showing `Too Many Requests` while `last_http` was `200`. Misleads any monitoring built on it. | open |
-| 3 | medium | The **no-data splash never pixel-shifts**. `pixelShiftIdx()` only re-renders through `renderFlight()`, so during a multi-day outage the splash is 100% static. Dimming to 25% mitigates burn-in but does not eliminate it. | open |
+| 1 | **high** | A `flight` field of only spaces (common in real ADS-B) yields an **empty ident** and is misclassified **COM**: `hasCallsign` is set from the untrimmed string, so padding counts as a callsign, and the `flight -> r -> hex` fallback never runs. Display shows a blank title where the callsign belongs. | **fixed 2026-08-23** |
+| 2 | medium | `last_err` in `/healthz` is never cleared on success or on transport errors, so it reports a stale message indefinitely — observed showing `Too Many Requests` while `last_http` was `200`. Misleads any monitoring built on it. | **fixed 2026-08-23** |
+| 3 | medium | The **no-data splash never pixel-shifts**. `pixelShiftIdx()` only re-renders through `renderFlight()`, so during a multi-day outage the splash is 100% static. Dimming to 25% mitigates burn-in but does not eliminate it. | **fixed 2026-08-23** |
 | 4 | low | Table entry `TISB_OTHER` (10 chars) can never be matched: `FlightInfo.typeCode` is `char[8]`, so the API value is truncated to `TISB_OT` before lookup. Harmless today only because the `TISB` prefix heuristic catches it first. No guard enforces the 7-char limit. | open |
 | 5 | low | Any **non-`"ground"` string** in `alt_baro` (e.g. `"12345"`) renders as `GND`. The check is `is<const char*>()`, which does not verify the value is actually `"ground"`. | open |
 | 6 | low | Altitudes beyond int32 (`alt_baro: 1e18`) wrap through `as<int32_t>()` to a value `<= 0` and render as `GND` rather than being rejected. | open |

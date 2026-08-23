@@ -63,8 +63,9 @@ struct FlightInfo {
 static void relaysPowerOnly();
 static void showSplash(const char *msgTop, const char *msgBottom = nullptr);
 static void setDisplayDim(bool dim);
+static uint8_t pixelShiftIdx();
 static bool resolveFriendlyName(const FlightInfo &fi, char* buf, size_t bufSize);
-static void drawCentered(const char *text, int16_t baselineY);
+static void drawCentered(const char *text, int16_t baselineY, int8_t dx = 0, int8_t dy = 0);
 
 // -----------------------------
 // OTA configuration (overridable in config.h)
@@ -288,7 +289,6 @@ static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 
 static uint32_t g_statOk = 0, g_statEmpty = 0, g_statFail = 0;
 static int g_statLastHttp = 0;
 static char g_statErrBuf[96] = "";
-static const char *g_statLastErr = "";
 static uint8_t g_fetchFailCount = 0;
 static uint32_t g_nextFetchAt = 0;
 static uint32_t g_lastDataMs = 0;  // millis() of last successful fetch with data
@@ -333,6 +333,10 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 #endif
 
 // Declared ahead of the HTTP handlers so /healthz can report what's on screen
+static char g_splashTop[40] = "";
+static char g_splashBottom[40] = "";
+static bool g_splashActive = false;
+static uint32_t g_statSplashDraws = 0;
 static bool g_haveDisplayed = false;
 static FlightInfo g_lastShown;
 
@@ -367,11 +371,14 @@ static void httpHandleHealth() {
   d["fetch_fail"] = g_statFail;
   d["fail_streak"] = g_fetchFailCount;
   d["last_http"] = g_statLastHttp;
-  d["last_err"] = g_statLastErr;
+  d["last_err"] = (const char*)g_statErrBuf;
   d["last_data_age_ms"] = g_lastDataMs ? (millis() - g_lastDataMs) : -1;
   d["next_fetch_in_ms"] = (int32_t)(g_nextFetchAt - millis());
   d["showing_flight"] = g_haveDisplayed;
   d["display_dim"] = g_displayDim;
+  d["splash_active"] = g_splashActive;
+  d["splash_draws"] = g_statSplashDraws;
+  d["shift_idx"] = pixelShiftIdx();
   d["alt_ft"] = g_lastShown.altitudeFt;
   d["dist_km"] = isnan(g_lastShown.distanceKm) ? -1.0 : g_lastShown.distanceKm;
   d["has_callsign"] = g_lastShown.hasCallsign;
@@ -601,14 +608,28 @@ static bool sameFlightDisplay(const FlightInfo &a, const FlightInfo &b) {
   return true;
 }
 
-static void drawCentered(const char *text, int16_t baselineY) {
+// Cycle through 1px offsets to prevent OLED image sticking on the mostly
+// static bottom bar. y only shifts up — the glyphs already sit at the bottom
+// edge of the panel opening, so shifting down would clip them.
+static const int8_t kPixelShifts[][2] = { {0,0}, {1,0}, {1,-1}, {0,-1}, {-1,-1}, {-1,0} };
+static constexpr uint8_t kPixelShiftCount = sizeof(kPixelShifts) / sizeof(kPixelShifts[0]);
+static uint8_t pixelShiftIdx() {
+  return (uint8_t)((millis() / PIXEL_SHIFT_INTERVAL_MS) % kPixelShiftCount);
+}
+
+static void drawCentered(const char *text, int16_t baselineY, int8_t dx, int8_t dy) {
   uint16_t w = u8g2.getUTF8Width(text);
   int16_t x = (SCREEN_WIDTH - (int)w) / 2;
   if (x < 0) x = 0;
-  u8g2.drawUTF8(x, baselineY, text);
+  u8g2.drawUTF8(x + dx, baselineY + dy, text);
 }
 
-static void showSplash(const char *msgTop, const char *msgBottom) {
+// The splash is the one screen that can stay up for days — a sustained API or
+// Wi-Fi outage pins it. Dimming alone does not move the lit pixels, so it gets
+// the same shift as the bottom bar, and loop() redraws it when the step changes.
+
+static void drawSplash(const char *msgTop, const char *msgBottom) {
+  g_statSplashDraws++;
   u8g2.clearBuffer();
   u8g2.setDrawColor(1);
 
@@ -632,24 +653,38 @@ static void showSplash(const char *msgTop, const char *msgBottom) {
   if (totalH < 0) totalH = 0;
   int16_t y0 = (SCREEN_HEIGHT - totalH) / 2;
 
+  const int8_t dx = kPixelShifts[pixelShiftIdx()][0];
+  const int8_t dy = kPixelShifts[pixelShiftIdx()][1];
+
   // Draw title centered
   u8g2.setFont(titleFont);
   int16_t base = y0 + titleAscent;
-  drawCentered("Flight Display", base);
+  drawCentered("Flight Display", base, dx, dy);
 
   // Draw first message
   u8g2.setFont(bodyFont);
   base = y0 + titleH + gap + bodyAscent;
-  drawCentered(msgTop, base);
+  drawCentered(msgTop, base, dx, dy);
 
   // Optional second message
   if (msgBottom) {
     base = y0 + titleH + gap + bodyH + gap + bodyAscent;
-    drawCentered(msgBottom, base);
+    drawCentered(msgBottom, base, dx, dy);
   }
 
   setDisplayDim(true);
   u8g2.sendBuffer();
+}
+
+static void showSplash(const char *msgTop, const char *msgBottom) {
+  // Copy before drawing so the pixel-shift redraw in loop() can reuse the text
+  // without aliasing its own source buffers.
+  strncpy(g_splashTop, msgTop ? msgTop : "", sizeof(g_splashTop) - 1);
+  g_splashTop[sizeof(g_splashTop) - 1] = '\0';
+  strncpy(g_splashBottom, msgBottom ? msgBottom : "", sizeof(g_splashBottom) - 1);
+  g_splashBottom[sizeof(g_splashBottom) - 1] = '\0';
+  g_splashActive = true;
+  drawSplash(msgTop, msgBottom);
 }
 
 static void connectWiFi() {
@@ -694,6 +729,12 @@ static double haversineKm(double lat1, double lon1, double lat2, double lon2) {
 #define POSITION_MAX_AGE_S 45
 #endif
 
+static bool hasNonSpace(const char* s) {
+  if (!s) return false;
+  for (; *s; ++s) if (*s != ' ') return true;
+  return false;
+}
+
 static bool extractLatLon(JsonObject obj, double &outLat, double &outLon) {
   // Only accept positions with a known, fresh age. No seen_pos = unknown
   // age = don't trust it.
@@ -720,26 +761,37 @@ static FlightInfo parseClosest(JsonVariant root) {
   double lat = NAN, lon = NAN;
   if (!extractLatLon(obj, lat, lon)) return res;
 
-  // Build ident preference chain: flight -> r -> hex
+  // Build ident preference chain: flight -> r -> hex.
+  // ADS-B pads the flight field to 8 characters, so an aircraft transmitting no
+  // callsign arrives as "        ". Testing *identSrc only rejects the empty
+  // string, which let padding win the chain: the title rendered blank and
+  // hasCallsign went true, classifying a private aircraft as commercial.
   const char* identSrc = nullptr;
   bool hasCallsign = false;
   if (obj["flight"]) {
-    identSrc = obj["flight"].as<const char*>();
-    hasCallsign = (identSrc && *identSrc);
+    const char* f = obj["flight"].as<const char*>();
+    if (hasNonSpace(f)) { identSrc = f; hasCallsign = true; }
   }
-  if (!identSrc || !*identSrc) {
-    if (obj["r"]) identSrc = obj["r"].as<const char*>();
+  if (!hasNonSpace(identSrc) && obj["r"]) {
+    const char* r = obj["r"].as<const char*>();
+    if (hasNonSpace(r)) identSrc = r;
   }
-  if (!identSrc || !*identSrc) {
-    if (obj["hex"]) identSrc = obj["hex"].as<const char*>();
+  if (!hasNonSpace(identSrc) && obj["hex"]) {
+    const char* hx = obj["hex"].as<const char*>();
+    if (hasNonSpace(hx)) identSrc = hx;
   }
-  if (!identSrc || !*identSrc) identSrc = "(unknown)";
+  if (!hasNonSpace(identSrc)) identSrc = "(unknown)";
 
   // Copy and trim ident
   strncpy(res.ident, identSrc, sizeof(res.ident) - 1);
   res.ident[sizeof(res.ident) - 1] = '\0';
-  // Trim trailing whitespace
+  // Trim trailing then leading spaces (the API pads on both sides in practice)
   for (int i = strlen(res.ident) - 1; i >= 0 && res.ident[i] == ' '; --i) res.ident[i] = '\0';
+  if (res.ident[0] == ' ') {
+    char* p = res.ident;
+    while (*p == ' ') ++p;
+    memmove(res.ident, p, strlen(p) + 1);
+  }
 
   // alt_baro is a number in feet, or the string "ground" for surface aircraft.
   // Some targets (MLAT/TIS-B, some GA) omit alt_baro — fall back to alt_geom.
@@ -816,6 +868,10 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
 
   int code = http.GET();
   g_statLastHttp = code;
+  // Cleared on every attempt: this field used to keep the last message that
+  // happened to fail, so /healthz reported "Too Many Requests" alongside a 200
+  // indefinitely and misled anything monitoring it.
+  g_statErrBuf[0] = '\0';
   LOG_INFO("HTTP status: %d", code);
   if (code != HTTP_CODE_OK) {
     LOG_WARN("HTTP error: %s", http.errorToString(code).c_str());
@@ -825,7 +881,10 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
       LOG_WARN("HTTP body: %s", body.c_str());
       strncpy(g_statErrBuf, body.c_str(), sizeof(g_statErrBuf) - 1);
       g_statErrBuf[sizeof(g_statErrBuf) - 1] = '\0';
-      g_statLastErr = g_statErrBuf;
+    } else {
+      // Transport-level failure has no body; record why anyway.
+      snprintf(g_statErrBuf, sizeof(g_statErrBuf), "transport: %s",
+               http.errorToString(code).c_str());
     }
     http.end();
     return FETCH_FAIL;
@@ -931,15 +990,6 @@ static bool resolveFriendlyName(const FlightInfo &fi, char* buf, size_t bufSize)
   return isPseudo;
 }
 
-// Cycle through 1px offsets to prevent OLED image sticking on the mostly
-// static bottom bar. y only shifts up — the glyphs already sit at the bottom
-// edge of the panel opening, so shifting down would clip them.
-static const int8_t kPixelShifts[][2] = { {0,0}, {1,0}, {1,-1}, {0,-1}, {-1,-1}, {-1,0} };
-static constexpr uint8_t kPixelShiftCount = sizeof(kPixelShifts) / sizeof(kPixelShifts[0]);
-static uint8_t pixelShiftIdx() {
-  return (uint8_t)((millis() / PIXEL_SHIFT_INTERVAL_MS) % kPixelShiftCount);
-}
-
 // Draw the bottom metric bar: distance | seats | altitude
 static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) {
   char distStr[16] = "\xE2\x80\x94";  // em-dash
@@ -972,6 +1022,7 @@ static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) 
 }
 
 static void renderFlight(const FlightInfo &fi) {
+  g_splashActive = false;
   setDisplayDim(false);
   u8g2.clearBuffer();
   u8g2.setDrawColor(1);
@@ -1190,6 +1241,7 @@ void loop() {
   if (shiftIdx != s_lastShiftIdx) {
     s_lastShiftIdx = shiftIdx;
     if (g_haveDisplayed) renderFlight(g_lastShown);
+    else if (g_splashActive) drawSplash(g_splashTop, g_splashBottom[0] ? g_splashBottom : nullptr);
   }
 
   // If test override is active, render it preferentially

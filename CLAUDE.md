@@ -110,7 +110,9 @@ Examples:
 
 - `SCREEN_WIDTH` defaults to 128 in .ino but config.h overrides to 256 — always check config.h
 - Display is rotated 180° (`U8G2_R2`) — (0,0) is bottom-right of physical display
-- `dbFlags` is **absent**, not zero, for non-military aircraft — the API omits the key entirely. `FlightInfo.dbFlags` uses -1 for absent, so test `dbFlags >= 0 && (dbFlags & 1)`; treating absence as unknown rather than as a negative is what previously justified the redundant `/v2/mil` scan.
+- ADS-B pads `flight` to 8 characters, so "no callsign" arrives as `"        "`, not as an empty string or an absent key. Test it with `hasNonSpace()`, never `*p` — padding otherwise wins the ident chain (blank title) and counts as a callsign (misclassifies PVT as COM).
+- Under the linked ArduinoJson **7.4.3**, `StaticJsonDocument<N>` is plain `JsonDocument`: `N` is ignored and allocation is on the heap. Responses above ~3.6 KB fail to parse as `EmptyInput` regardless of `N`; unreachable today because `/v2/closest` returns one aircraft.
+- - `dbFlags` is **absent**, not zero, for non-military aircraft — the API omits the key entirely. `FlightInfo.dbFlags` uses -1 for absent, so test `dbFlags >= 0 && (dbFlags & 1)`; treating absence as unknown rather than as a negative is what previously justified the redundant `/v2/mil` scan.
 - `WiFi.setAutoReconnect(true)` handles most reconnects but has no backoff
 - The Arduino core initializes the task watchdog (5s, panic) but **never subscribes `loopTask`**, so a wedged `loop()` hangs forever by default. `setup()` now reconfigures it to `LOOP_WDT_TIMEOUT_S` (25s) and subscribes. Any new blocking I/O in `loop()` must either finish inside that window or call `esp_task_wdt_reset()` as it works, like the MIL scan does.
 - HTTP timeouts are sized from measured latency (p50 957ms / p95 1270ms over 428 live fetches), not guessed. Keep them well under `LOOP_WDT_TIMEOUT_S` or a slow API will look like a hang and reboot the device.

@@ -22,20 +22,20 @@ pass=0
 while :; do
   pass=$((pass + 1))
   say "--- pass $pass: data-path probe ---"
-  ./tools/probe.py --mock-host "$MOCK" >>"$LOGDIR/overnight.log" 2>&1
+  ./tools/with-device-lock.sh ./tools/probe.py --mock-host "$MOCK" >>"$LOGDIR/overnight.log" 2>&1
   say "probe exit=$?"
 
   say "--- pass $pass: fault injection ---"
-  ./tools/faults.py --mock-host "$MOCK" run >>"$LOGDIR/overnight.log" 2>&1
+  ./tools/with-device-lock.sh ./tools/faults.py --mock-host "$MOCK" run >>"$LOGDIR/overnight.log" 2>&1
   say "faults exit=$?"
 
   say "--- pass $pass: display harness ---"
-  ./tools/harness.py run --dwell 2 >>"$LOGDIR/overnight.log" 2>&1
+  ./tools/with-device-lock.sh ./tools/harness.py run --dwell 2 >>"$LOGDIR/overnight.log" 2>&1
   say "harness exit=$?"
 
   # Hand the device back to the real API so the soak keeps collecting genuine
   # traffic, heap and latency data between test bursts.
-  ./tools/faults.py --mock-host "$MOCK" restore >>"$LOGDIR/overnight.log" 2>&1
+  ./tools/with-device-lock.sh ./tools/faults.py --mock-host "$MOCK" restore >>"$LOGDIR/overnight.log" 2>&1
   say "--- pass $pass done; live soak for ${LIVE_MINUTES}m ---"
   sleep $((LIVE_MINUTES * 60))
 done
