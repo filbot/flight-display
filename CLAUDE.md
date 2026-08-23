@@ -105,7 +105,18 @@ Examples:
 - **Aircraft lookup**: Binary search on sorted, unique-key `kTypeInfo[]` by ICAO only (no IATA fallback — API `t` is always ICAO), then ~15 family-prefix heuristics. Unknown types fall back to the API `desc` field, then the raw code.
 - **Staleness**: Positions without fresh `seen_pos` are rejected. Displayed flight clears to splash after `STALE_DISPLAY_MAX_MS` (default 5 min) without a successful refresh; an empty-but-valid API response ("no aircraft nearby") clears immediately and doesn't count as a fetch failure.
 - **Display rendering**: Font cascade (32pt → 24pt → 20pt → 10pt → 9pt → 6pt) with 2-line word wrapping. Bottom bar: distance | seats | altitude in 3 equal cells.
-- **Emergency squawk**: 7500 (`HIJACK 7500`), 7600 (`RADIO FAIL 7600`), 7700 (`EMERGENCY 7700`). `selectAircraft()` lets the nearest *emergency* aircraft preempt the nearest aircraft overall. The banner occupies **only** the type-name area — **the bottom row must never change**, its three cells (distance | seats | altitude) are physically labelled on the display bezel.
+- **Alerts**: two independent sources feed one priority ladder in `kAlerts[]` — the reserved transponder codes and the ADS-B `emergency` status field. They overlap for hijack/radio/general, but **`lifeguard`, `minfuel` and `downed` exist only in the status field**, so a squawk-only check is blind to them.
+
+  | Priority | Status | Squawk | Banner |
+  |---|---|---|---|
+  | 6 | `unlawful` | 7500 | `HIJACK 7500` |
+  | 5 | `downed` | — | `DOWNED AIRCRAFT` |
+  | 4 | `general` | 7700 | `EMERGENCY 7700` |
+  | 3 | `minfuel` | — | `MIN FUEL` |
+  | 2 | `nordo` | 7600 | `RADIO FAIL 7600` |
+  | 1 | `lifeguard` | — | `LIFEGUARD` |
+
+  `selectAircraft()` lets an alerting aircraft preempt the nearest one: **severity beats proximity**, and distance only separates aircraft at the same severity. `ALERT_PREEMPT_MIN_PRIORITY` (default 1, so everything shows) raises the bar if medical flights prove too frequent. The banner occupies **only** the type-name area — **the bottom row must never change**, its three cells (distance | seats | altitude) are physically labelled on the display bezel.
 - **Relay mapping**: Status=IN1, PVT=IN2, COM=IN3, MIL=IN4 (configurable via `RELAY_*_PIN`)
 - **Test override**: `PUT /test/closest` with JSON body to inject test flight data (5-min TTL)
 - **Health**: `GET /healthz` returns JSON telemetry (uptime, reset reason, heap free/min/largest-block, RSSI, fetch ok/empty/fail counters, last HTTP status and error body, last-data age, what's on screen, dim state). `GET /` stays plain `OK`.

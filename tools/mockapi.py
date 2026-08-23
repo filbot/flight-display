@@ -27,7 +27,7 @@ what the device actually asked for.
 Fault mode is read per-request from logs/mock.mode:
 
     ok empty http403 http429 http500 malformed truncated slow hang garbage
-    bigmil mil custom ratelimit uaenforce far emergency
+    bigmil mil custom ratelimit uaenforce far emergency lifeguard priority
 """
 import argparse, json, math, os, re, ssl, subprocess, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -233,6 +233,18 @@ class Handler(BaseHTTPRequestHandler):
                 # The 8 km C172 squawks 7700 while the 3 km B738 is normal, so a
                 # correct implementation shows the EMERGENCY one, not the nearest.
                 inside = [dict(a, squawk="7700") if a["t"] == "C172" else a for a in inside]
+            if m == "lifeguard":
+                # No squawk equivalent exists: lifeguard lives only in the
+                # ADS-B emergency/priority status field.
+                inside = [dict(a, emergency="lifeguard") if a["t"] == "C172" else a
+                          for a in inside]
+            if m == "priority":
+                # Two alerting aircraft at once: the NEARER one is only a
+                # lifeguard, the farther one is squawking 7700. Severity must
+                # win over proximity.
+                inside = [dict(a, emergency="lifeguard") if a["t"] == "B738"
+                          else (dict(a, squawk="7700") if a["t"] == "C172" else a)
+                          for a in inside]
             if m == "mil":
                 # The military aircraft becomes the nearest, so /v2/closest
                 # exercises the dbFlags classification path.
@@ -266,6 +278,18 @@ class Handler(BaseHTTPRequestHandler):
                 # The 8 km C172 squawks 7700 while the 3 km B738 is normal, so a
                 # correct implementation shows the EMERGENCY one, not the nearest.
                 inside = [dict(a, squawk="7700") if a["t"] == "C172" else a for a in inside]
+            if m == "lifeguard":
+                # No squawk equivalent exists: lifeguard lives only in the
+                # ADS-B emergency/priority status field.
+                inside = [dict(a, emergency="lifeguard") if a["t"] == "C172" else a
+                          for a in inside]
+            if m == "priority":
+                # Two alerting aircraft at once: the NEARER one is only a
+                # lifeguard, the farther one is squawking 7700. Severity must
+                # win over proximity.
+                inside = [dict(a, emergency="lifeguard") if a["t"] == "B738"
+                          else (dict(a, squawk="7700") if a["t"] == "C172" else a)
+                          for a in inside]
             if m == "mil":
                 mil = mil or [FLEET[-1]]
             if n:

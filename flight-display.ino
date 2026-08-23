@@ -49,6 +49,7 @@ struct FlightInfo {
   int16_t seatOverride;    // if >0, override seat display
   int16_t dbFlags;         // adsb.lol dbFlags field; bit 0 = military
   char squawk[8];          // transponder code; 7500/7600/7700 are emergencies
+  char emergency[12];      // ADS-B emergency/priority status; "none" when normal
 
   FlightInfo() : altitudeFt(-1), lat(NAN), lon(NAN), distanceKm(NAN),
                  hasCallsign(false), valid(false), seatOverride(-1), dbFlags(-1) {
@@ -59,17 +60,51 @@ struct FlightInfo {
     hex[0] = '\0';
     opClass[0] = '\0';
     squawk[0] = '\0';
+    emergency[0] = '\0';
   }
 };
 
-// The three internationally reserved emergency transponder codes. Returns the
-// label to show, or nullptr when the code is an ordinary one.
-static const char* emergencyLabel(const char* squawk) {
-  if (!squawk || !*squawk) return nullptr;
-  if (strcmp(squawk, "7500") == 0) return "HIJACK 7500";
-  if (strcmp(squawk, "7600") == 0) return "RADIO FAIL 7600";
-  if (strcmp(squawk, "7700") == 0) return "EMERGENCY 7700";
-  return nullptr;
+// Alert conditions, most severe first. Two independent sources feed the same
+// ladder: the three reserved transponder codes, and the ADS-B emergency/priority
+// status field. They overlap for hijack/radio/general, but lifeguard, minimum
+// fuel and downed exist ONLY in the status field — a squawk-only check is blind
+// to them.
+struct AlertLevel {
+  const char* status;  // adsb.lol "emergency" value
+  const char* squawk;  // equivalent transponder code, or nullptr if none exists
+  const char* label;   // shown in the type-name area
+  uint8_t priority;    // higher wins when several aircraft are alerting
+};
+static const AlertLevel kAlerts[] = {
+  { "unlawful",  "7500", "HIJACK 7500",     6 },
+  { "downed",    nullptr, "DOWNED AIRCRAFT", 5 },
+  { "general",   "7700", "EMERGENCY 7700",  4 },
+  { "minfuel",   nullptr, "MIN FUEL",        3 },
+  { "nordo",     "7600", "RADIO FAIL 7600", 2 },
+  { "lifeguard", nullptr, "LIFEGUARD",       1 },
+};
+
+// Only conditions at or above this priority take over the display from the
+// nearest aircraft. Default 1 shows everything, lifeguard included; raise it if
+// medical flights prove too frequent to be interesting.
+#ifndef ALERT_PREEMPT_MIN_PRIORITY
+#define ALERT_PREEMPT_MIN_PRIORITY 1
+#endif
+
+// Resolve an aircraft's alert from either source. Returns nullptr when normal.
+static const AlertLevel* alertFor(const char* squawk, const char* status) {
+  const AlertLevel* best = nullptr;
+  for (const AlertLevel &a : kAlerts) {
+    bool hit = (status && *status && strcasecmp(status, a.status) == 0)
+            || (a.squawk && squawk && strcmp(squawk, a.squawk) == 0);
+    if (hit && (!best || a.priority > best->priority)) best = &a;
+  }
+  return best;
+}
+
+static const char* emergencyLabel(const char* squawk, const char* status = nullptr) {
+  const AlertLevel* a = alertFor(squawk, status);
+  return a ? a->label : nullptr;
 }
 // Local function prototypes used before definitions
 static void relaysPowerOnly();
@@ -401,8 +436,9 @@ static void httpHandleHealth() {
   d["db_flags"] = g_lastShown.dbFlags;
   d["category"] = (const char*)g_lastShown.category;
   d["squawk"] = (const char*)g_lastShown.squawk;
+  d["emergency_status"] = (const char*)g_lastShown.emergency;
   {
-    const char *al = emergencyLabel(g_lastShown.squawk);
+    const char *al = emergencyLabel(g_lastShown.squawk, g_lastShown.emergency);
     d["emergency"] = al ? al : "";
   }
   {
@@ -464,6 +500,10 @@ static void httpHandlePutClosest() {
   if (!doc["squawk"].isNull()) {
     strncpy(fi.squawk, doc["squawk"].as<const char*>(), sizeof(fi.squawk) - 1);
     fi.squawk[sizeof(fi.squawk) - 1] = '\0';
+  }
+  if (!doc["emergency"].isNull()) {
+    strncpy(fi.emergency, doc["emergency"].as<const char*>(), sizeof(fi.emergency) - 1);
+    fi.emergency[sizeof(fi.emergency) - 1] = '\0';
   }
   if (fi.opClass[0] == '\0') {
     strncpy(fi.opClass, (fi.seatOverride > 0 && fi.seatOverride <= 15) ? "PVT" : "COM", sizeof(fi.opClass) - 1);
@@ -627,6 +667,7 @@ static bool sameFlightDisplay(const FlightInfo &a, const FlightInfo &b) {
   if (a.altitudeFt != b.altitudeFt) return false;
   if (strcmp(a.opClass, b.opClass) != 0) return false;
   if (strcmp(a.squawk, b.squawk) != 0) return false;
+  if (strcmp(a.emergency, b.emergency) != 0) return false;
   // Consider distances equal within 0.1 km to avoid flicker
   double da = isnan(a.distanceKm) ? 0 : a.distanceKm;
   double db = isnan(b.distanceKm) ? 0 : b.distanceKm;
@@ -844,6 +885,12 @@ static FlightInfo parseAircraft(JsonObject obj) {
   const char* sqSrc = obj["squawk"].isNull() ? nullptr : obj["squawk"].as<const char*>();
   if (sqSrc) { strncpy(res.squawk, sqSrc, sizeof(res.squawk) - 1); res.squawk[sizeof(res.squawk) - 1] = '\0'; }
 
+  const char* emSrc = obj["emergency"].isNull() ? nullptr : obj["emergency"].as<const char*>();
+  if (emSrc && strcasecmp(emSrc, "none") != 0) {
+    strncpy(res.emergency, emSrc, sizeof(res.emergency) - 1);
+    res.emergency[sizeof(res.emergency) - 1] = '\0';
+  }
+
   res.valid = true;
   res.lat = lat;
   res.lon = lon;
@@ -911,8 +958,9 @@ class PatientStream : public Stream {
 // whole reason for fetching every aircraft in the circle is to notice one.
 // Among several emergencies the nearest wins.
 static FlightInfo selectAircraft(JsonVariant root) {
-  FlightInfo best;      // nearest valid aircraft
-  FlightInfo emerg;     // nearest valid aircraft squawking an emergency
+  FlightInfo best;            // nearest valid aircraft
+  FlightInfo alerted;         // best alerting aircraft, by priority then distance
+  uint8_t alertedPri = 0;
   if (!root.is<JsonObject>()) return best;
   JsonObject robj = root.as<JsonObject>();
   if (!robj.containsKey("ac") || !robj["ac"].is<JsonArray>()) return best;
@@ -921,12 +969,23 @@ static FlightInfo selectAircraft(JsonVariant root) {
     FlightInfo fi = parseAircraft(obj);
     if (!fi.valid || isnan(fi.distanceKm)) continue;
     if (!best.valid || fi.distanceKm < best.distanceKm) best = fi;
-    if (emergencyLabel(fi.squawk) && (!emerg.valid || fi.distanceKm < emerg.distanceKm)) emerg = fi;
+
+    const AlertLevel* a = alertFor(fi.squawk, fi.emergency);
+    if (!a || a->priority < ALERT_PREEMPT_MIN_PRIORITY) continue;
+    // A more severe condition always outranks a closer one; distance only
+    // separates aircraft at the same severity.
+    if (a->priority > alertedPri
+        || (a->priority == alertedPri && alerted.valid && fi.distanceKm < alerted.distanceKm)) {
+      alerted = fi;
+      alertedPri = a->priority;
+    }
   }
-  if (emerg.valid) {
-    LOG_WARN("Emergency squawk %s on %s at %.1f km — preempting nearest",
-             emerg.squawk, emerg.ident, emerg.distanceKm);
-    return emerg;
+  if (alerted.valid) {
+    const AlertLevel* a = alertFor(alerted.squawk, alerted.emergency);
+    LOG_WARN("Alert %s (%s/%s) on %s at %.1f km — preempting nearest",
+             a ? a->label : "?", alerted.squawk, alerted.emergency,
+             alerted.ident, alerted.distanceKm);
+    return alerted;
   }
   return best;
 }
@@ -1014,7 +1073,8 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
   acObj["seen_pos"] = true;
   acObj["category"] = true;
   acObj["dbFlags"] = true;  // bit 0 = military
-  acObj["squawk"] = true;   // 7500/7600/7700 are emergencies
+  acObj["squawk"] = true;    // 7500/7600/7700 are emergencies
+  acObj["emergency"] = true; // lifeguard/minfuel/downed have no squawk
   acObj["desc"] = true;     // full type description (title fallback)
 
   StaticJsonDocument<2048> doc;  // stack-allocated; filtered single-aircraft response is well under 1KB
@@ -1144,7 +1204,7 @@ static void renderFlight(const FlightInfo &fi) {
   // labelled on the bezel, so its three cells must never change meaning.
   char friendlyBuf[64];
   bool isPseudo = resolveFriendlyName(fi, friendlyBuf, sizeof(friendlyBuf));
-  const char *alert = emergencyLabel(fi.squawk);
+  const char *alert = emergencyLabel(fi.squawk, fi.emergency);
 
   // Bottom metrics font (~50% larger than before)
   const uint8_t *bottomFont = u8g2_font_9x18_tf;  // was 6x12

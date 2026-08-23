@@ -6,6 +6,23 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-23: alert feature (squawk codes + emergency status)
+
+Extended beyond the three transponder codes to the ADS-B emergency/priority
+status field, because **`lifeguard`, `minfuel` and `downed` have no squawk
+equivalent** — they are transmitted only in that field, so the squawk-only
+version could never have seen them. Verified directly: the `lifeguard` flow test
+shows the banner while the aircraft squawks an ordinary 1200.
+
+One priority ladder (`kAlerts[]`) serves both sources: unlawful 6, downed 5,
+general 4, minfuel 3, nordo 2, lifeguard 1. Severity beats proximity — a 7700 at
+8 km outranks a lifeguard at 3 km — and distance only separates equals. Where
+the two sources disagree the more severe wins (squawk 7600 plus status
+`unlawful` renders `HIJACK 7500`). `ALERT_PREEMPT_MIN_PRIORITY` raises the
+preempt bar if medical flights turn out to be too common to be interesting.
+
+Verified: flows 13/13, faults 10/10, display harness 24/24.
+
 ## 2026-08-23: emergency squawk feature
 
 The primary search moved from `/v2/closest` to `/v2/point`, so the firmware now

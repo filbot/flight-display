@@ -61,6 +61,17 @@ CASES = [
      "ordinary squawk: normal type name, no banner"),
     ("sq_long",   dict(ident="LONGCALLSIGN99", t="B77W", alt=41000, dist=99.9, seats=396, squawk="7700"),
      "long ident on the banner must not overflow 256px"),
+    # These three exist ONLY in the ADS-B emergency/priority status field —
+    # there is no transponder code for them.
+    ("em_lifeguard", dict(ident="LIFE01", t="C208", alt=3000, dist=4.0, seats=9, emergency="lifeguard"),
+     "banner 'LIFEGUARD' (medical flight, ordinary squawk)"),
+    ("em_minfuel",   dict(ident="FUEL22", t="A320", alt=9000, dist=18.0, seats=186, emergency="minfuel"),
+     "banner 'MIN FUEL'"),
+    ("em_downed",    dict(ident="DOWN33", t="C172", alt=-2, dist=2.0, seats=4, emergency="downed"),
+     "banner 'DOWNED AIRCRAFT'; altitude cell still reads GND"),
+    ("em_beats_sq",  dict(ident="BOTH44", t="B738", alt=20000, dist=6.0, seats=189,
+                          squawk="7600", emergency="unlawful"),
+     "both sources set: the more severe one wins, banner 'HIJACK 7500'"),
 ]
 
 

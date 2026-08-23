@@ -226,6 +226,35 @@ def t_emergency_preempts(mock):
     set_mode("ok")
 
 
+def t_lifeguard(mock):
+    """lifeguard has NO squawk equivalent — it exists only in the status field,
+    so a squawk-only implementation is blind to it."""
+    set_mode("lifeguard")
+    c = health()
+    force_fetch(mock)
+    h = wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1, timeout=90)
+    ok = h.get("emergency") == "LIFEGUARD" and h.get("type") == "C172" \
+        and h.get("emergency_status") == "lifeguard"
+    check("lifeguard", ok,
+          f"type={h.get('type')!r} status={h.get('emergency_status')!r} "
+          f"banner={h.get('emergency')!r} squawk={h.get('squawk')!r}",
+          "medical flight is surfaced from the status field, with no squawk set")
+    set_mode("ok")
+
+
+def t_alert_priority(mock):
+    """Severity beats proximity: a 7700 at 8 km outranks a lifeguard at 3 km."""
+    set_mode("priority")
+    c = health()
+    force_fetch(mock)
+    h = wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1, timeout=90)
+    ok = h.get("emergency") == "EMERGENCY 7700" and h.get("type") == "C172"
+    check("alert_priority", ok,
+          f"type={h.get('type')!r} dist={h.get('dist_km')} banner={h.get('emergency')!r}",
+          "the more severe alert wins even though the other aircraft is closer")
+    set_mode("ok")
+
+
 def t_normal_squawk_ignored(mock):
     """An ordinary squawk must change nothing — the nearest aircraft still wins."""
     set_mode("ok")
@@ -282,7 +311,8 @@ def main():
     req("PUT", "/test/apibase", {"base": mock})
     time.sleep(4)
     for t in (t_radius_conversion, t_home_coords, t_tiered_fallback, t_no_widen_when_found,
-              t_uses_point_endpoint, t_emergency_preempts, t_normal_squawk_ignored,
+              t_uses_point_endpoint, t_emergency_preempts, t_lifeguard, t_alert_priority,
+              t_normal_squawk_ignored,
               t_user_agent, t_override_ttl, t_empty_clears, t_recovers):
         try:
             t(mock)
