@@ -271,6 +271,7 @@ static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 
 // Lifetime counters for the health endpoint — cheap, and the only way to see
 // slow drift (failure ratio, empty-sky ratio) over a multi-day soak.
 static uint32_t g_statOk = 0, g_statEmpty = 0, g_statFail = 0;
+static uint32_t g_statMilOk = 0, g_statMilIncomplete = 0;
 static int g_statLastHttp = 0;
 static char g_statErrBuf[96] = "";
 static const char *g_statLastErr = "";
@@ -306,7 +307,8 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 
 // MIL cache — uses fixed char arrays to avoid heap allocation
 static constexpr uint32_t MIL_CACHE_TTL_POS = 6UL * 60UL * 60UL * 1000UL;  // 6h for confirmed results
-static constexpr uint32_t MIL_CACHE_TTL_NEG = 1UL * 60UL * 60UL * 1000UL;  // 1h for negative/failure results
+static constexpr uint32_t MIL_CACHE_TTL_NEG = 1UL * 60UL * 60UL * 1000UL;  // 1h for a confirmed negative
+static constexpr uint32_t MIL_CACHE_TTL_UNKNOWN = 5UL * 60UL * 1000UL;    // 5m when the lookup itself failed
 struct MilCacheEntry {
   char hex[8];    // ICAO hex is always 6 chars + null
   uint32_t ts;
@@ -364,6 +366,8 @@ static void httpHandleHealth() {
   d["fetch_empty"] = g_statEmpty;
   d["fetch_fail"] = g_statFail;
   d["fail_streak"] = g_fetchFailCount;
+  d["mil_ok"] = g_statMilOk;
+  d["mil_incomplete"] = g_statMilIncomplete;
   d["last_http"] = g_statLastHttp;
   d["last_err"] = g_statLastErr;
   d["last_data_age_ms"] = g_lastDataMs ? (millis() - g_lastDataMs) : -1;
@@ -517,10 +521,9 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
     return false;
   }
   http.addHeader("Accept", "application/json");
-  http.addHeader("Accept-Encoding", "identity");
-  // setUserAgent, not addHeader: HTTPClient always writes its own User-Agent and
-  // Connection lines, so addHeader sent a duplicate UA and adsb.lol read the
-  // generic "ESP32HTTPClient" one and 403'd us.
+  // setUserAgent, not addHeader: HTTPClient::addHeader silently DROPS
+  // User-Agent, Connection, Accept-Encoding and Host, so the addHeader version
+  // never left the device and adsb.lol saw the generic built-in UA and 403'd us.
   http.setUserAgent(API_USER_AGENT);
 
   int code = http.GET();
@@ -552,18 +555,38 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
   // Absolute wall-clock timeout — never resets per chunk (rollover-safe subtraction)
   uint32_t startTime = millis();
   Stream &s = http.getStream();
+  // Content-Length decides completeness. adsb.lol answers /v2/mil with
+  // "Connection: keep-alive", so client.connected() stays true after the last
+  // byte — testing it marked every successful scan as a stall. Fall back to the
+  // connection test only when the length is unknown (chunked).
+  const int expected = http.getSize();
+  size_t totalRead = 0;
   bool complete = false;  // true only if we reached a clean end-of-stream
   while ((millis() - startTime) < MIL_LOOKUP_HARD_TIMEOUT_MS) {
+    if (expected >= 0 && totalRead >= (size_t)expected) {
+      complete = true;  // got every promised byte
+      break;
+    }
     int n = s.readBytes(readBuf, CHUNK);
     if (n <= 0) {
-      yield();  // cooperative yield, no blocking delay()
-      if (!s.available()) {
-        // Drained + server closed = clean EOF; still connected = stall
-        complete = !client.connected();
+      // available()==0 does NOT mean end-of-stream: over TLS the body arrives
+      // in bursts and the buffer drains between them. Treating it as EOF cut
+      // every scan short (~4 KB of a 24 KB body). Only a closed connection with
+      // an empty buffer is a real end; otherwise wait for the next burst and
+      // let the wall-clock timeout be the bound.
+      if (!client.connected() && !s.available()) {
+        complete = (expected >= 0) ? (totalRead >= (size_t)expected) : true;
         break;
+      }
+      uint32_t waitStart = millis();
+      while (!s.available() && client.connected()
+             && (millis() - waitStart) < 50
+             && (millis() - startTime) < MIL_LOOKUP_HARD_TIMEOUT_MS) {
+        yield();  // cooperative, no blocking delay()
       }
       continue;
     }
+    totalRead += (size_t)n;
     // Lowercase the new data for case-insensitive matching
     for (int j = 0; j < n; ++j) readBuf[j] = tolower(readBuf[j]);
     readBuf[n] = '\0';
@@ -588,10 +611,14 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
   http.end();
   if (!complete) {
     // Timed-out or stalled scan is NOT an authoritative "not military" —
-    // report failure so the caller caches with the short negative TTL.
-    LOG_WARN("MIL scan incomplete (timeout/stall), result unknown");
+    // report failure so the caller caches it as unknown, not as a negative.
+    g_statMilIncomplete++;
+    LOG_WARN("MIL scan incomplete (read %u of %d bytes), result unknown",
+             (unsigned)totalRead, expected);
     return false;
   }
+  g_statMilOk++;
+  LOG_INFO("MIL scan complete (%u bytes), not military", (unsigned)totalRead);
   return true;  // completed scan, not found => not mil
 }
 
@@ -663,7 +690,11 @@ static void resolveMilitaryStatus(const FlightInfo &fi) {
   if (ok) {
     milCacheStore(fi.hex, isMil, isMil ? MIL_CACHE_TTL_POS : MIL_CACHE_TTL_NEG);
   } else {
-    milCacheStore(fi.hex, false, MIL_CACHE_TTL_NEG);
+    // A failed lookup is not evidence of anything. Cache "not military" just
+    // long enough to keep a broken /v2/mil from being re-scanned every cycle,
+    // then retry — the whole point of tracking completeness is lost if this
+    // gets the same hour-long TTL as an authoritative negative.
+    milCacheStore(fi.hex, false, MIL_CACHE_TTL_UNKNOWN);
   }
 }
 
@@ -922,10 +953,9 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
     return FETCH_FAIL;
   }
   http.addHeader("Accept", "application/json");
-  http.addHeader("Accept-Encoding", "identity");
-  // setUserAgent, not addHeader: HTTPClient always writes its own User-Agent and
-  // Connection lines, so addHeader sent a duplicate UA and adsb.lol read the
-  // generic "ESP32HTTPClient" one and 403'd us.
+  // setUserAgent, not addHeader: HTTPClient::addHeader silently DROPS
+  // User-Agent, Connection, Accept-Encoding and Host, so the addHeader version
+  // never left the device and adsb.lol saw the generic built-in UA and 403'd us.
   http.setUserAgent(API_USER_AGENT);
 
   int code = http.GET();

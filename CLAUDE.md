@@ -112,13 +112,15 @@ Examples:
 
 - `SCREEN_WIDTH` defaults to 128 in .ino but config.h overrides to 256 — always check config.h
 - Display is rotated 180° (`U8G2_R2`) — (0,0) is bottom-right of physical display
-- The `/v2/mil` endpoint returns ALL military aircraft globally and streams the full response — this blocks loop() for potentially seconds. Use `dbFlags` first.
+- The `/v2/mil` endpoint returns ALL military aircraft globally (~25 KB, `Content-Length` set, `Connection: keep-alive`) and blocks loop() for ~0.7s per scan. Use `dbFlags` first.
 - `WiFi.setAutoReconnect(true)` handles most reconnects but has no backoff
 - `client.setInsecure()` — no TLS cert verification (standard for ESP32 IoT)
 - `alt_baro` is a number in feet OR the string `"ground"` — parsed to the `ALT_GROUND` sentinel (-2), rendered as `GND`
 - Duplicate ICAO variants (freighter/winglet) must NOT be added back to `kTypeInfo[]` — the `t` field can't distinguish them, and binary search requires unique sorted keys
-- **Never `addHeader("User-Agent", ...)` or `addHeader("Connection", ...)`** — ESP32 `HTTPClient` writes both lines itself (`HTTPClient.cpp:1150`), so `addHeader` sends a *duplicate* header and the server may read the built-in generic one. Use `http.setUserAgent()`, which replaces it.
+- **`HTTPClient::addHeader()` SILENTLY DROPS `User-Agent`, `Connection`, `Accept-Encoding` and `Host`** (`HTTPClient.cpp:992` filters them; it writes its own at `:1150`). The call compiles, runs, and does nothing — that's how the generic built-in UA reached adsb.lol and earned a 403. Use `setUserAgent()` / `setAcceptEncoding()` instead. The `_acceptEncoding` default (`identity;q=1,chunked;q=0.1,*;q=0`) already prefers identity, so no setter is needed for that.
 - adsb.lol returns **403 with body `User-Agent too generic; include valid contact info.`** for anonymous-looking clients. `API_USER_AGENT` must carry a real email or project URL and is set in `config.h` (gitignored). The same request from a laptop can return 200 while the device gets 403, so don't test this with curl alone — read the device's own error body.
 - Non-2xx API responses: always log `http.getString()` (bounded). The status code alone hid this 403's cause completely.
 - `arduino-cli monitor` **exits immediately when stdin is not a TTY**, so it cannot be used for detached/background logging. Read the port directly, holding the fd open with `exec 3<>` so the `stty` settings survive (each fresh open resets the port to 9600 on macOS).
+- **`stream.available() == 0` is NOT end-of-stream.** Over TLS the body arrives in bursts and the buffer drains between them. Breaking the read loop on `!available()` truncated every `/v2/mil` scan at ~4 KB of 25 KB. Loop until `Content-Length` (`http.getSize()`) is satisfied; treat only *closed connection + empty buffer* as EOF, with a wall-clock timeout as the bound.
+- Conversely, **`client.connected()` stays true after a complete body** when the server keeps the connection alive, so it cannot be used to detect a clean end either.
 - **Opening the USB serial port reboots the board** (DTR toggle). A reset logged at the moment a monitor attaches is an artifact, not a fault. USB flashing and serial logging contend for the port — stop the logger or flash via OTA.
