@@ -6,3 +6,4 @@ config.h
 *.bak
 *.tmp
 *.pdf
+logs/
