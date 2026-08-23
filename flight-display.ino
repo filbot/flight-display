@@ -251,13 +251,17 @@ static char g_apiBase[96] = API_BASE;
 #define API_USER_AGENT "flight-display/1.0 (ESP32 ADS-B display; set API_CONTACT in config.h)"
 #endif
 
-// Display brightness (SSD1322 contrast register, 0-255). Splash screens are
-// static for as long as the outage lasts, so they run dimmed to cut burn-in.
+// Display brightness (SSD1322 contrast register, 0-255). The register sets the
+// segment drive current, so lowering it cuts the OLED's rate of luminance decay
+// roughly in proportion — this panel runs 24/7, so it is held at 60% of full
+// scale to buy lifetime rather than driven flat out.
+// Perceived brightness falls less than the number suggests (the response is
+// non-linear), so raise it here if the panel reads too dim in daylight.
 #ifndef DISPLAY_CONTRAST
-#define DISPLAY_CONTRAST 255
+#define DISPLAY_CONTRAST 153  // 60% of 255
 #endif
 #ifndef DISPLAY_CONTRAST_DIM
-#define DISPLAY_CONTRAST_DIM (DISPLAY_CONTRAST / 4)  // 75% dimmer
+#define DISPLAY_CONTRAST_DIM (DISPLAY_CONTRAST / 4)  // 75% below normal (38 at the default)
 #endif
 
 // ponytail: two levels, no fade ramp — add easing only if the step is jarring

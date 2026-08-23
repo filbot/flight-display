@@ -104,7 +104,7 @@ Examples:
 - **Relay mapping**: Status=IN1, PVT=IN2, COM=IN3, MIL=IN4 (configurable via `RELAY_*_PIN`)
 - **Test override**: `PUT /test/closest` with JSON body to inject test flight data (5-min TTL)
 - **Health**: `GET /healthz` returns JSON telemetry (uptime, reset reason, heap free/min/largest-block, RSSI, fetch ok/empty/fail counters, last HTTP status and error body, last-data age, what's on screen, dim state). `GET /` stays plain `OK`.
-- **Display dimming**: splash screens run at `DISPLAY_CONTRAST_DIM` (default 25% of `DISPLAY_CONTRAST`) to limit OLED burn-in during outages; `renderFlight()` restores full brightness. Driven from one call site each, so any new splash inherits it.
+- **Display brightness**: `DISPLAY_CONTRAST` is **153** (60% of full scale), not 255 — the SSD1322 contrast register sets drive current, so running the panel below maximum slows luminance decay on a 24/7 display. Splashes run at `DISPLAY_CONTRAST_DIM` (25% of that, so 38) to limit burn-in during outages; `renderFlight()` restores normal brightness. Both are `#ifndef`-guarded, so override in `config.h` if the panel reads too dim.
 
 ## Gotchas
 
