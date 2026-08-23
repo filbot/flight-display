@@ -1413,6 +1413,10 @@ void setup() {
         WiFi.setTxPower(WIFI_RUN_TXPOWER);
         WiFi.setSleep(false);
         WiFi.setAutoReconnect(true);  // may have been disabled by a test drop
+        // Fetch as soon as the link is back. Deferring link-down cycles to the
+        // normal 30s interval otherwise leaves the display stale for up to a
+        // full interval after recovery (measured at 26s before this line).
+        g_nextFetchAt = millis();
         // Wi‑Fi up; print reminder of server endpoint
         Serial.println(F("[HTTP] Server ready on port 80"));
 #if FEATURE_OTA
@@ -1449,6 +1453,20 @@ void setup() {
   // Start HTTP listener early; it will become reachable after Wi‑Fi is up
   httpStartOnce();
 #endif
+}
+
+// Stop showing a flight that can no longer be refreshed and put the dimmed
+// splash up instead. Shared by the fetch-failed and link-down paths, because
+// the display must age out either way.
+static void expireStaleDisplay() {
+  if (g_haveDisplayed && (millis() - g_lastDataMs) > STALE_DISPLAY_MAX_MS) {
+    LOG_WARN("Displayed data stale > %lu ms, clearing", (unsigned long)STALE_DISPLAY_MAX_MS);
+    g_haveDisplayed = false;
+    g_lastShown = FlightInfo();
+  }
+  if (!g_haveDisplayed) {
+    showSplash("No data", "Check Wi-Fi/API");
+  }
 }
 
 void loop() {
@@ -1514,6 +1532,29 @@ void loop() {
   // Rollover-safe: signed difference handles millis() wrap at ~49.7 days
   if ((int32_t)(now - g_nextFetchAt) >= 0) {
     checkHeap();
+
+    // A down link is not a failed fetch — no attempt was made. Counting it as
+    // one froze g_fetchFailCount at 0 (correctly, so the API circuit breaker
+    // cannot misfire) which in turn pinned the retry interval at the backoff
+    // floor of ~4.3s, spending a long outage re-failing and redrawing the
+    // splash ~840 times an hour. Reschedule at the normal interval instead and
+    // let the display age out exactly as it would otherwise.
+    static bool s_linkDown = false;
+    if (WiFi.status() != WL_CONNECTED) {
+      if (!s_linkDown) {
+        s_linkDown = true;
+        LOG_WARN("Wi-Fi down; deferring fetches until the link returns");
+      }
+      g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
+      expireStaleDisplay();
+      yield();
+      return;
+    }
+    if (s_linkDown) {
+      s_linkDown = false;
+      LOG_INFO("Wi-Fi back; resuming fetches");
+    }
+
     FlightInfo nearest;
     FetchResult fr = fetchNearestFlight(nearest);
     if (fr == FETCH_OK) {
@@ -1553,15 +1594,7 @@ void loop() {
       uint32_t retryMs = backoffMs(max(g_fetchFailCount, (uint8_t)1));
       g_nextFetchAt = millis() + retryMs;
       LOG_WARN("Fetch failed (attempt %d), next retry in %lu ms", g_fetchFailCount, (unsigned long)retryMs);
-      // Stale-data end of life: stop showing a flight we can't refresh
-      if (g_haveDisplayed && (millis() - g_lastDataMs) > STALE_DISPLAY_MAX_MS) {
-        LOG_WARN("Displayed data stale > %lu ms, clearing", (unsigned long)STALE_DISPLAY_MAX_MS);
-        g_haveDisplayed = false;
-        g_lastShown = FlightInfo();
-      }
-      if (!g_haveDisplayed) {
-        showSplash("No data", "Check Wi-Fi/API");
-      }
+      expireStaleDisplay();
     }
   }
 

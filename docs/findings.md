@@ -33,12 +33,22 @@ Confirmed working:
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| 15 | low | **No backoff during a Wi-Fi outage.** Because `g_fetchFailCount` is deliberately frozen while the link is down, `backoffMs()` is always called with 1 and the retry interval stays pinned at ~4.3s — observed 16 times in a 90s hold, every one logging `Fetch failed (attempt 0)`. Each attempt is instant so there is no real cost, but it produces ~840 log lines an hour and, once the display has cleared, ~840 full-framebuffer splash redraws an hour. Contrast with an API outage, where backoff correctly grows to the 60s cap. | open |
+| 15 | low | **No backoff during a Wi-Fi outage.** Because `g_fetchFailCount` is deliberately frozen while the link is down, `backoffMs()` is always called with 1 and the retry interval stays pinned at ~4.3s — observed 16 times in a 90s hold, every one logging `Fetch failed (attempt 0)`. Each attempt is instant so there is no real cost, but it produces ~840 log lines an hour and, once the display has cleared, ~840 full-framebuffer splash redraws an hour. Contrast with an API outage, where backoff correctly grows to the 60s cap. | **fixed 2026-08-23** |
 
-Suggested fix for #15: while `WiFi.status() != WL_CONNECTED`, do not treat the
-cycle as a fetch failure at all — reschedule at the normal `FETCH_INTERVAL_MS`.
-"We never tried" is not "we tried and failed", and it keeps the failure counter
-meaning one thing.
+**#15 fix:** a down link is no longer routed through the failure path at all.
+`loop()` now defers the cycle at the normal `FETCH_INTERVAL_MS` and calls the
+extracted `expireStaleDisplay()`, so the display still ages out to the dimmed
+splash exactly as before. Measured over a 120s outage: `Fetch failed (attempt 0)`
+went **16 -> 0**, and the down/up transitions each log once instead of every
+cycle.
+
+**A regression the fix introduced, and its fix.** Deferring to the 30s interval
+meant that after the link returned the device waited out the remainder before
+fetching — measured at **26 seconds** of stale display post-recovery, where the
+old 4.3s retry had recovered almost immediately. Setting `g_nextFetchAt =
+millis()` in the `GOT_IP` handler brings that to **1 second**. Worth recording
+that removing wasteful retries quietly removed the fast recovery they were
+providing.
 
 ### Still not covered
 
