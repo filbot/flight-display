@@ -34,14 +34,40 @@ family as the old /v2/mil scanner:** "nothing buffered yet" is not "no data".
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| 13 | medium (blocks `/v2/point`) | Above ~14 KB the parse now fails as **`IncompleteInput`** rather than `EmptyInput` — a *mid-stream* gap, not a start-of-stream one. The first-byte wait cannot help; ArduinoJson stops when a read comes back short partway through the document. Fixing it needs a buffering/waiting `Stream` wrapper so a momentary TLS gap blocks instead of ending the document. | open |
+| 13 | medium (blocks `/v2/point`) | Above ~14 KB the parse failed as **`IncompleteInput`** — a *mid-stream* gap rather than a start-of-stream one, which the first-byte wait could not address. | **fixed 2026-08-23** |
 
-**Why #13 matters for product decisions:** `/v2/closest` returns ~700 B, so
-nothing today is affected. But switching to `/v2/point` to catch emergency
-squawks would pull every aircraft in the radius — roughly 7 KB at the 10 km
-primary radius (fine), but around **65 KB at the 100 km fallback radius**, well
-past the ceiling. So `/v2/point` is viable for the primary circle only until #13
-is fixed.
+**#13 fix:** `PatientStream`, a `Stream` wrapper whose `readBytes()` waits for the
+next burst instead of reporting end-of-input, bounded by one overall deadline so
+`loop()` stays inside the watchdog. Only `readBytes()` needed overriding —
+ArduinoJson reads exclusively through it — and reading the client directly is
+safe because these responses always carry `Content-Length` (never chunked).
+
+Measured ceiling, before and after the two fixes together:
+
+| Payload | Originally | After first-byte wait | After `PatientStream` |
+|---|---|---|---|
+| 3.6 KB | OK | OK | OK |
+| 7.2 KB | fail | OK | OK |
+| 14.4 KB | fail | OK | OK |
+| 28.8 KB | fail | fail | **OK** |
+| 57.6 KB | fail | fail | **OK** |
+| 112 KB | fail | fail | fails as `NoMemory` |
+
+The ceiling moved from ~3.6 KB to beyond 57 KB — 16x — and the remaining limit
+is now an honest resource constraint rather than a spurious truncation. Heap
+returns to ~195.6 KB after every parse, so nothing leaks.
+
+**What this unlocks, measured live at HOME:** `/v2/point` returns 2.6 KB at the
+10 km primary radius (5 aircraft) and 44.2 KB at the 100 km fallback (95
+aircraft). Both now parse. The primary circle is the safe one: 2.6 KB is trivial,
+whereas a 44 KB parse transiently consumes most of the heap. So the recommended
+shape is **`/v2/point` for the primary circle, `/v2/closest` for the rare
+fallback** — the fallback only fires when the sky nearby is empty, and then the
+only question is "nearest thing anywhere", which `/v2/closest` answers in 591 B.
+
+Caveat for peak traffic: 2.6 KB was 5 aircraft on a quiet evening 10 km from
+SEA. An arrival push could put 20-30 aircraft in the same circle (10-16 KB),
+which is now comfortably inside the ceiling but was not before this fix.
 
 **Upstream caveat noticed while reading the core:** `NetworkClient::readBytes()`
 computes its deadline as `int to = millis() + getTimeout()`. `millis()` exceeds

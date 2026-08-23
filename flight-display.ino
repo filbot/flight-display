@@ -834,6 +834,57 @@ static FlightInfo parseClosest(JsonVariant root) {
   return res;
 }
 
+// ArduinoJson's stream reader stops the moment a read returns short, so a
+// momentary gap in a TLS stream ends the document part-way (IncompleteInput)
+// even though the rest is milliseconds behind. This wrapper makes a gap WAIT
+// for the next burst instead of reporting end-of-input, bounded by one overall
+// deadline so loop() stays well inside the task watchdog.
+//
+// Only readBytes() needs overriding: ArduinoJson reads exclusively through it.
+// Safe because these responses carry Content-Length (never chunked encoding),
+// so reading the client directly needs no de-chunking.
+class PatientStream : public Stream {
+ public:
+  PatientStream(WiFiClientSecure &c, uint32_t budgetMs)
+      : c_(c), deadline_(millis() + budgetMs) {}
+
+  int available() override { return c_.available(); }
+  int peek() override { return c_.peek(); }
+  size_t write(uint8_t) override { return 0; }
+  int read() override {
+    char ch;
+    return readBytes(&ch, 1) == 1 ? (int)(unsigned char)ch : -1;
+  }
+
+  size_t readBytes(char *buffer, size_t length) override {
+    size_t got = 0;
+    while (got < length) {
+      if (!waitForBytes()) break;
+      int n = c_.read((uint8_t *)buffer + got, length - got);
+      if (n > 0) got += (size_t)n;
+    }
+    return got;
+  }
+
+  bool timedOut() const { return timedOut_; }
+
+ private:
+  // True once at least one byte is ready. False only on a hard end: the overall
+  // deadline expired, or the peer closed with nothing left buffered.
+  bool waitForBytes() {
+    while (c_.available() == 0) {
+      if ((int32_t)(millis() - deadline_) >= 0) { timedOut_ = true; return false; }
+      if (!c_.connected() && c_.available() == 0) return false;
+      yield();
+    }
+    return true;
+  }
+
+  WiFiClientSecure &c_;
+  uint32_t deadline_;
+  bool timedOut_ = false;
+};
+
 static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
   if (WiFi.status() != WL_CONNECTED) return FETCH_FAIL;
 
@@ -916,25 +967,15 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
   acObj["desc"] = true;     // full type description (title fallback)
 
   StaticJsonDocument<2048> doc;  // stack-allocated; filtered single-aircraft response is well under 1KB
-  // The body can lag the headers. Above roughly 3.6 KB the response spans more
-  // than one TLS record, so at this point available() is 0 even though the data
-  // is milliseconds away (measured: 7221-byte body, avail 0 -> 7221 in 16ms).
-  // ArduinoJson's reader gives up on an empty stream and returns EmptyInput, so
-  // wait for the first byte before handing the stream over. Same failure family
-  // as the old /v2/mil scanner: "nothing buffered yet" is not "no data".
-  {
-    Stream &body = http.getStream();
-    uint32_t waitStart = millis();
-    while (body.available() == 0 && client.connected()
-           && (millis() - waitStart) < HTTP_READ_TIMEOUT_MS) {
-      yield();
-    }
-  }
   // Prefer streamed parsing to minimize RAM and fragmentation
-  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
+  // PatientStream, not http.getStream(): a bare stream reports a momentary TLS
+  // gap as end-of-input, which truncated every response over ~3.6 KB.
+  PatientStream body(client, HTTP_READ_TIMEOUT_MS);
+  DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
   http.end();
   if (err) {
-    LOG_WARN("JSON parse error (streamed): %s", err.c_str());
+    LOG_WARN("JSON parse error (streamed): %s%s", err.c_str(),
+             body.timedOut() ? " [read deadline expired]" : "");
     return FETCH_FAIL;
   }
 
