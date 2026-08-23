@@ -21,10 +21,14 @@ log_serial() {
   # detached. Read the port directly instead: hold the fd open with exec so the
   # stty settings stick (each fresh open resets them back to 9600 on macOS).
   # Opening the port toggles DTR and reboots the ESP32 — expect one reset here.
+  # Non-printable bytes (boot ROM output at a different baud) are squashed to '.'
+  # so the log stays plain text; otherwise grep treats it as binary and silently
+  # prints nothing for patterns that are really there.
   # Retry forever so a device reboot or USB re-enumeration can't end the capture.
   while :; do
     echo "$(date -u +%FT%TZ) [monitor] attaching to $PORT" >>"$LOGDIR/serial.log"
     sh -c 'exec 3<>"$1"; stty -f "$1" 115200 raw -echo; cat <&3' _ "$PORT" 2>/dev/null \
+      | LC_ALL=C tr -c '\11\12\15\40-\176' '.' \
       | while IFS= read -r line; do
           printf '%s %s\n' "$(date -u +%FT%TZ)" "$line"
         done >>"$LOGDIR/serial.log"

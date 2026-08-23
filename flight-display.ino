@@ -229,6 +229,12 @@ static const char *resetReasonStr() {
 }
 #endif
 
+// API base is runtime-switchable so the fault-injection harness can point the
+// device at a local mock without reflashing between scenarios. Defaults to the
+// compiled API_BASE and is only mutable through the test endpoint, which is
+// itself behind FEATURE_TEST_ENDPOINT.
+static char g_apiBase[96] = API_BASE;
+
 // adsb.lol returns 403 "User-Agent too generic; include valid contact info."
 // for anonymous-looking clients. Real contact string lives in config.h (gitignored).
 #ifndef API_USER_AGENT
@@ -377,6 +383,7 @@ static void httpHandleHealth() {
   d["ident"] = (const char*)g_lastShown.ident;
   d["type"] = (const char*)g_lastShown.typeCode;
   d["op"] = (const char*)g_lastShown.opClass;
+  d["api_base"] = (const char*)g_apiBase;
   d["test_override"] = g_test.active && (int32_t)(millis() - g_test.expiresAt) < 0;
   String out;
   serializeJson(d, out);
@@ -440,6 +447,34 @@ static void httpHandlePutClosest() {
   g_http.send(200, "application/json", out);
 }
 
+// Point the device at a mock API (fault injection) or back at the real one.
+// PUT body: {"base":"https://192.168.1.50:8443"}   DELETE: restore compiled default.
+static void httpHandlePutApiBase() {
+  if (!g_http.hasArg("plain")) { g_http.send(400, "text/plain", "Missing body"); return; }
+  StaticJsonDocument<192> doc;
+  if (deserializeJson(doc, g_http.arg("plain"))) { g_http.send(400, "text/plain", "Bad JSON"); return; }
+  const char *base = doc["base"];
+  if (!base || !*base || strlen(base) >= sizeof(g_apiBase)) {
+    g_http.send(400, "text/plain", "Bad base");
+    return;
+  }
+  strncpy(g_apiBase, base, sizeof(g_apiBase) - 1);
+  g_apiBase[sizeof(g_apiBase) - 1] = '\0';
+  g_fetchFailCount = 0;      // a deliberate switch is not a failure streak
+  g_nextFetchAt = millis();  // re-fetch immediately against the new base
+  LOG_WARN("API base switched to %s", g_apiBase);
+  g_http.send(200, "application/json", String("{\"base\":\"") + g_apiBase + "\"}");
+}
+
+static void httpHandleDeleteApiBase() {
+  strncpy(g_apiBase, API_BASE, sizeof(g_apiBase) - 1);
+  g_apiBase[sizeof(g_apiBase) - 1] = '\0';
+  g_fetchFailCount = 0;
+  g_nextFetchAt = millis();
+  LOG_WARN("API base restored to %s", g_apiBase);
+  g_http.send(200, "application/json", String("{\"base\":\"") + g_apiBase + "\"}");
+}
+
 static void httpHandleDeleteClosest() {
   g_test.active = false;
   g_test.dirty = false;
@@ -454,6 +489,8 @@ static void httpStartOnce() {
   g_http.on("/test/closest", HTTP_GET, httpHandleGetClosest);
   g_http.on("/test/closest", HTTP_PUT, httpHandlePutClosest);
   g_http.on("/test/closest", HTTP_DELETE, httpHandleDeleteClosest);
+  g_http.on("/test/apibase", HTTP_PUT, httpHandlePutApiBase);
+  g_http.on("/test/apibase", HTTP_DELETE, httpHandleDeleteApiBase);
   g_http.begin();
   g_httpStarted = true;
   LOG_INFO("HTTP test server listening on :80");
@@ -506,7 +543,7 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
   isMilOut = false;
   if (WiFi.status() != WL_CONNECTED || !hex || !*hex) return false;
   char url[128];
-  snprintf(url, sizeof(url), "%s/v2/mil", API_BASE);
+  snprintf(url, sizeof(url), "%s/v2/mil", g_apiBase);
   LOG_INFO("HTTP GET %s", url);
 
   HTTPClient http;
@@ -933,7 +970,7 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
   // Build URL with stack-allocated buffer (no heap allocation)
   char url[128];
   snprintf(url, sizeof(url), "%s/v2/closest/%.6f/%.6f/%d",
-           API_BASE, HOME_LAT, HOME_LON, radiusNm);
+           g_apiBase, HOME_LAT, HOME_LON, radiusNm);
   LOG_INFO("HTTP GET %s", url);
   LOG_DEBUG("WiFi RSSI: %d dBm", WiFi.RSSI());
   LOG_DEBUG("Free heap: %u", (unsigned)ESP.getFreeHeap());
