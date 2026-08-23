@@ -40,7 +40,7 @@ Display driver: `U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI` with full framebuffer.
 - **IDE**: Arduino IDE or `arduino-cli`
 - **Board**: ESP32 Dev Module (`esp32:esp32:esp32`)
 - **Partition scheme**: **Minimal SPIFFS (1.9MB APP with OTA)** — required; the sketch exceeds the default 1.25MB app partition. CLI: `arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=min_spiffs .`. Do NOT use "Huge APP" (removes the second app slot and breaks OTA).
-- **Libraries**: U8g2 (olikraus), ArduinoJson 6.x, WiFi/WiFiClientSecure/HTTPClient/WebServer (ESP32 core)
+- **Libraries**: U8g2 2.36.19, **ArduinoJson 7.4.3** (NOT 6.x — under 7.x `StaticJsonDocument<N>` ignores `N` and uses the heap), WiFi/WiFiClientSecure/HTTPClient/WebServer (ESP32 core 3.3.11). Pinned in `sketch.yaml`; build reproducibly with `arduino-cli compile --profile esp32`.
 - **Setup**: Copy `example-config.h` to `config.h`, fill in WiFi credentials, `HOME_LAT`/`HOME_LON`, `SEARCH_RADIUS_KM`
 
 ## Architecture
@@ -135,7 +135,7 @@ Examples:
 - The Arduino core initializes the task watchdog (5s, panic) but **never subscribes `loopTask`**, so a wedged `loop()` hangs forever by default. `setup()` now reconfigures it to `LOOP_WDT_TIMEOUT_S` (25s) and subscribes. Any new blocking I/O in `loop()` must either finish inside that window or call `esp_task_wdt_reset()` as it works, like the MIL scan does.
 - HTTP timeouts are sized from measured latency (p50 957ms / p95 1270ms over 428 live fetches), not guessed. Keep them well under `LOOP_WDT_TIMEOUT_S` or a slow API will look like a hang and reboot the device.
 - `client.setInsecure()` — no TLS cert verification (standard for ESP32 IoT)
-- `alt_baro` is a number in feet OR the string `"ground"` — parsed to the `ALT_GROUND` sentinel (-2), rendered as `GND`
+- `alt_baro` is a number in feet OR the exact string `"ground"`. Decoding order matters: any **present** non-positive value means on the surface (`ALT_GROUND`, -2), so `ALT_UNKNOWN` (-1) means only "field absent". Values outside -2000..200000 ft are rejected as unknown rather than wrapped.
 - Duplicate ICAO variants (freighter/winglet) must NOT be added back to `kTypeInfo[]` — the `t` field can't distinguish them, and binary search requires unique sorted keys
 - **`HTTPClient::addHeader()` SILENTLY DROPS `User-Agent`, `Connection`, `Accept-Encoding` and `Host`** (`HTTPClient.cpp:992` filters them; it writes its own at `:1150`). The call compiles, runs, and does nothing — that's how the generic built-in UA reached adsb.lol and earned a 403. Use `setUserAgent()` / `setAcceptEncoding()` instead. The `_acceptEncoding` default (`identity;q=1,chunked;q=0.1,*;q=0`) already prefers identity, so no setter is needed for that.
 - adsb.lol returns **403 with body `User-Agent too generic; include valid contact info.`** for anonymous-looking clients. `API_USER_AGENT` must carry a real email or project URL and is set in `config.h` (gitignored). The same request from a laptop can return 200 while the device gets 403, so don't test this with curl alone — read the device's own error body.

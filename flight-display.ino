@@ -26,6 +26,7 @@
 
 // Sentinel for alt_baro == "ground" (aircraft on the surface)
 static constexpr int32_t ALT_GROUND = -2;
+static constexpr int32_t ALT_UNKNOWN = -1;  // field absent; a PRESENT -1 is treated as ground
 
 // Distinguishes "API answered, nothing displayable nearby" from real failures
 // so quiet skies don't trigger backoff or the restart circuit breaker.
@@ -38,7 +39,7 @@ struct FlightInfo {
   char typeCode[8];    // aircraft type (t)
   char category[4];    // raw ADS-B category code (A1-A7, B1-B7, C1-C3)
   char desc[48];       // API type description; title fallback when table misses
-  int32_t altitudeFt;  // -1 = unknown, ALT_GROUND = on ground
+  int32_t altitudeFt;  // ALT_UNKNOWN = absent, ALT_GROUND = on the surface
   double lat;
   double lon;
   double distanceKm;
@@ -51,7 +52,7 @@ struct FlightInfo {
   char squawk[8];          // transponder code; 7500/7600/7700 are emergencies
   char emergency[12];      // ADS-B emergency/priority status; "none" when normal
 
-  FlightInfo() : altitudeFt(-1), lat(NAN), lon(NAN), distanceKm(NAN),
+  FlightInfo() : altitudeFt(ALT_UNKNOWN), lat(NAN), lon(NAN), distanceKm(NAN),
                  hasCallsign(false), valid(false), seatOverride(-1), dbFlags(-1) {
     ident[0] = '\0';
     typeCode[0] = '\0';
@@ -504,7 +505,7 @@ static void httpHandlePutClosest() {
   strncpy(fi.ident, identSrc, sizeof(fi.ident) - 1); fi.ident[sizeof(fi.ident) - 1] = '\0';
   const char* tSrc = doc["t"].isNull() ? "" : doc["t"].as<const char*>();
   strncpy(fi.typeCode, tSrc, sizeof(fi.typeCode) - 1); fi.typeCode[sizeof(fi.typeCode) - 1] = '\0';
-  fi.altitudeFt = doc["alt"].isNull() ? -1 : doc["alt"].as<int32_t>();
+  fi.altitudeFt = doc["alt"].isNull() ? ALT_UNKNOWN : doc["alt"].as<int32_t>();
   fi.distanceKm = doc["dist"].isNull() ? NAN : doc["dist"].as<double>();
   fi.hasCallsign = true;
   if (!doc["op"].isNull()) {
@@ -695,6 +696,9 @@ static const char* classifyOp(const FlightInfo &fi) {
     if (strcmp(fi.category, "A1") == 0 || strcmp(fi.category, "A7") == 0) return "PVT";
     // A3=Large, A4=High vortex, A5=Heavy → likely commercial
     if (strcmp(fi.category, "A3") == 0 || strcmp(fi.category, "A4") == 0 || strcmp(fi.category, "A5") == 0) return "COM";
+    // B* = glider, balloon/airship, parachutist, ultralight, UAV, spacecraft.
+    // None of them are commercial passenger operations.
+    if (fi.category[0] == 'B') return "PVT";
   }
 
   // 5) Default: COM if it carries a callsign, else PVT
@@ -838,6 +842,20 @@ static double haversineKm(double lat1, double lon1, double lat2, double lon2) {
 #define POSITION_MAX_AGE_S 45
 #endif
 
+// Feet, or a sentinel. Values outside any plausible flight envelope are junk
+// (a value beyond int32 used to wrap to something <= 0 and render as GND, which
+// is worse than admitting we do not know).
+static constexpr int32_t ALT_PLAUSIBLE_MAX = 200000;   // above any aircraft or balloon
+static constexpr int32_t ALT_PLAUSIBLE_MIN = -2000;    // below the lowest dry land
+static int32_t decodeAltitude(JsonVariantConst v) {
+  long long ft = v.as<long long>();
+  if (ft > ALT_PLAUSIBLE_MAX || ft < ALT_PLAUSIBLE_MIN) return ALT_UNKNOWN;
+  // Present and at or below sea level means on the surface: seaplanes and
+  // taxiing aircraft without a squat switch report 0 or slightly negative.
+  if (ft <= 0) return ALT_GROUND;
+  return (int32_t)ft;
+}
+
 static bool hasNonSpace(const char* s) {
   if (!s) return false;
   for (; *s; ++s) if (*s != ' ') return true;
@@ -847,7 +865,10 @@ static bool hasNonSpace(const char* s) {
 static bool extractLatLon(JsonObject obj, double &outLat, double &outLon) {
   // Only accept positions with a known, fresh age. No seen_pos = unknown
   // age = don't trust it.
-  if (!obj.containsKey("seen_pos")) return false;
+  // containsKey alone is not enough: a null passes it and as<double>() yields 0,
+  // which would read as "brand new" — the opposite of unknown.
+  if (!obj.containsKey("seen_pos") || obj["seen_pos"].isNull()) return false;
+  if (!obj["seen_pos"].is<float>() && !obj["seen_pos"].is<int>()) return false;
   if (obj["seen_pos"].as<double>() > POSITION_MAX_AGE_S) return false;
   if (obj.containsKey("lat") && obj.containsKey("lon")) {
     outLat = obj["lat"].as<double>();
@@ -897,14 +918,24 @@ static FlightInfo parseAircraft(JsonObject obj) {
 
   // alt_baro is a number in feet, or the string "ground" for surface aircraft.
   // Some targets (MLAT/TIS-B, some GA) omit alt_baro — fall back to alt_geom.
-  if (obj["alt_baro"].is<const char*>()) res.altitudeFt = ALT_GROUND;
-  else if (!obj["alt_baro"].isNull()) res.altitudeFt = obj["alt_baro"].as<int32_t>();
-  else if (!obj["alt_geom"].isNull()) res.altitudeFt = obj["alt_geom"].as<int32_t>();
-  else res.altitudeFt = -1;
-  // Readings at or below 0 ft mean "on the surface" for display purposes —
-  // seaplanes and taxiing aircraft without a squat switch report "airborne"
-  // with baro/geom altitudes of 0 or slightly negative near sea level.
-  if (res.altitudeFt <= 0 && res.altitudeFt != -1) res.altitudeFt = ALT_GROUND;
+  // Altitude decoding. Order matters: a value that is PRESENT and non-positive
+  // means "on the surface", while -1 is reserved for "absent". Applying the
+  // surface rule first removes the old ambiguity where a real -1 ft reading was
+  // indistinguishable from a missing field.
+  //
+  // alt_baro is a number in feet, or the exact string "ground". Any other
+  // string is not a known encoding, so it is treated as unknown rather than
+  // silently rendered as GND.
+  if (obj["alt_baro"].is<const char*>()) {
+    const char* ab = obj["alt_baro"].as<const char*>();
+    res.altitudeFt = (ab && strcasecmp(ab, "ground") == 0) ? ALT_GROUND : ALT_UNKNOWN;
+  } else if (!obj["alt_baro"].isNull()) {
+    res.altitudeFt = decodeAltitude(obj["alt_baro"]);
+  } else if (!obj["alt_geom"].isNull()) {
+    res.altitudeFt = decodeAltitude(obj["alt_geom"]);
+  } else {
+    res.altitudeFt = ALT_UNKNOWN;
+  }
 
   // "t" = aircraft type designator (B738, A320, etc.)
   // Note: "type" is a different field (message type: adsb_icao, tisb, mlat) — do NOT use as fallback

@@ -15,7 +15,9 @@ struct AircraftTypeInfo {
 };
 
 // Table is sorted by ICAO code (case-insensitive) with unique keys to enable
-// binary search. Variant sub-types sharing an ICAO code (freighter/winglet)
+// binary search. Keys must be <= 7 characters: FlightInfo.typeCode is char[8],
+// so the API value is truncated before lookup and a longer key can never match
+// (tools/hosttest/test_types.cpp enforces this). Variant sub-types sharing an ICAO code (freighter/winglet)
 // are not listed separately — the "t" field cannot distinguish them.
 static const AircraftTypeInfo kTypeInfo[] = {
   { "A10", "", "Fairchild", "A-10", 0 },
@@ -501,7 +503,6 @@ static const AircraftTypeInfo kTypeInfo[] = {
   { "TBM8", "", "Daher", "TBM 850", 6 },
   { "TBM9", "", "Daher", "TBM 900", 6 },
   { "TEX2", "", "Raytheon", "Texan II", 2 },
-  { "TISB_OTHER", "", "TIS-B", "TIS-B Other", 6 },
   { "TOBA", "", "Socata", "TB-10 Tobago", 4 },
   { "U206", "", "Cessna", "U206 Stationair", 6 },
   { "UH60", "", "Sikorsky", "UH-60 Black Hawk", 14 },

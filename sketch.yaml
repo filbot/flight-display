@@ -1,0 +1,16 @@
+# Reproducible build pin. The firmware behaves differently across ArduinoJson
+# majors: under 7.x StaticJsonDocument<N> ignores N and allocates on the heap,
+# whereas under 6.x it is a real fixed pool. A fresh checkout resolving to 6.x
+# would silently get different memory and parse behaviour, so the versions that
+# were actually tested are recorded here.
+#
+#   arduino-cli compile --profile esp32
+#   arduino-cli upload  --profile esp32 -p <port|ip>
+profiles:
+  esp32:
+    fqbn: esp32:esp32:esp32:PartitionScheme=min_spiffs
+    platforms:
+      - platform: esp32:esp32 (3.3.11)
+    libraries:
+      - ArduinoJson (7.4.3)
+      - U8g2 (2.36.19)

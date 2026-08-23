@@ -6,6 +6,56 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-23 late: cleared the low-severity backlog
+
+Seven findings closed. Each was measured as unreachable through `/v2/closest`,
+but "unreachable today" is a property of the endpoint, not of the code — and
+`/v2/point` had already changed which endpoint we use, so leaving them was no
+longer clearly the safer choice.
+
+- **#7 altitude sentinel** — reordered so the surface rule is applied to any
+  value that is *present*, leaving `-1` to mean only "absent". A real -1 ft
+  reading now reads as `GND` instead of an em-dash, and no sentinel had to move.
+- **#5 alt_baro strings** — only the exact string `"ground"` means ground. Any
+  other string is unknown rather than silently rendered as `GND`.
+- **#6 implausible altitudes** — decoded through `long long` and range-checked
+  (-2000 to 200000 ft). A value beyond int32 is now rejected as unknown instead
+  of wrapping to something `<= 0` and displaying as `GND`.
+- **#8 `seen_pos: null`** — an explicit null (or a non-numeric value) is an
+  unknown age, so the position is rejected. `containsKey()` alone passed a null
+  whose `as<double>()` is 0, which read as "brand new".
+- **#9 B categories** — glider, balloon/airship, parachutist, ultralight, UAV
+  and spacecraft all classify PVT rather than falling through to the callsign
+  rule and landing on COM.
+- **#4 `TISB_OTHER`** — removed. At 10 characters it could never match a
+  `char[8]` `typeCode`, and the host test now enforces the 7-character limit.
+- **#10 library pinning** — `sketch.yaml` records the platform and library
+  versions actually tested. The ArduinoJson major matters: under 7.x
+  `StaticJsonDocument<N>` ignores `N` and uses the heap; under 6.x it is a real
+  fixed pool. Build with `arduino-cli compile --profile esp32`.
+
+Eleven probe cases were promoted from exploratory to asserted, so each of these
+behaviours is now pinned rather than merely observed.
+
+Verified: probe 11/11 on the changed cases, flows 13/13, faults 10/10, display
+harness 24/24, wifitest 9/9, host type-table test all green (492 entries).
+
+### Deliberately not fixed
+
+**#14 (DNS stalls `loop()` for 15s)** and **#11 (connect and read are separate
+8s budgets)** stay open on purpose. There is no cheap safe fix: the ESP32 core
+exposes no bounded `hostByName()`, the lwIP DNS timeout lives in `sdkconfig`
+rather than the Arduino API, and connecting by cached IP would break TLS SNI to
+adsb.lol's ingress. The honest options are to accept it — 15s sits inside the
+25s watchdog, and during an internet outage backoff caps at 60s so the stall is
+roughly a 25% duty cycle on a device that has nothing useful to do anyway — or
+to move fetching onto its own FreeRTOS task so `loop()` never blocks. The latter
+is a real architectural change and should be a deliberate decision, not a
+drive-by fix.
+
+---
+
+
 ## 2026-08-23 22:00 UTC: Wi-Fi reconnect path — finally tested
 
 Two AP experiments failed to disassociate the device (the router was cycled, not
@@ -384,13 +434,13 @@ serial + `/healthz` capture.
 | 1 | **high** | A `flight` field of only spaces (common in real ADS-B) yields an **empty ident** and is misclassified **COM**: `hasCallsign` is set from the untrimmed string, so padding counts as a callsign, and the `flight -> r -> hex` fallback never runs. Display shows a blank title where the callsign belongs. | **fixed 2026-08-23** |
 | 2 | medium | `last_err` in `/healthz` is never cleared on success or on transport errors, so it reports a stale message indefinitely — observed showing `Too Many Requests` while `last_http` was `200`. Misleads any monitoring built on it. | **fixed 2026-08-23** |
 | 3 | medium | The **no-data splash never pixel-shifts**. `pixelShiftIdx()` only re-renders through `renderFlight()`, so during a multi-day outage the splash is 100% static. Dimming to 25% mitigates burn-in but does not eliminate it. | **fixed 2026-08-23** |
-| 4 | low | Table entry `TISB_OTHER` (10 chars) can never be matched: `FlightInfo.typeCode` is `char[8]`, so the API value is truncated to `TISB_OT` before lookup. Harmless today only because the `TISB` prefix heuristic catches it first. No guard enforces the 7-char limit. | open |
-| 5 | low | Any **non-`"ground"` string** in `alt_baro` (e.g. `"12345"`) renders as `GND`. The check is `is<const char*>()`, which does not verify the value is actually `"ground"`. | open |
-| 6 | low | Altitudes beyond int32 (`alt_baro: 1e18`) wrap through `as<int32_t>()` to a value `<= 0` and render as `GND` rather than being rejected. | open |
-| 7 | low | A genuine altitude of exactly **-1 ft** is indistinguishable from "absent" — both use `-1` — so it renders as an em-dash instead of `GND`. | open |
-| 8 | low | `seen_pos: null` is treated as **fresh**: `as<double>()` yields `0`. Violates the function's own stated rule that unknown age must not be trusted (`containsKey` passes, the null does not). | open |
-| 9 | low | ADS-B category `B2` (balloon/airship) falls through to the callsign rule and classifies **COM**. Only `A1/A7` map to PVT and `A3/A4/A5` to COM. | open |
-| 10 | info | `CLAUDE.md` documents ArduinoJson **6.x**; the installed and linked library is **7.4.3**, where `StaticJsonDocument` is deprecated and heap-backed. The `// stack-allocated` and "no heap allocation" comments in `fetchClosestAt` are therefore inaccurate. | open |
+| 4 | low | Table entry `TISB_OTHER` (10 chars) can never be matched: `FlightInfo.typeCode` is `char[8]`, so the API value is truncated to `TISB_OT` before lookup. Harmless today only because the `TISB` prefix heuristic catches it first. No guard enforces the 7-char limit. | **fixed 2026-08-23** |
+| 5 | low | Any **non-`"ground"` string** in `alt_baro` (e.g. `"12345"`) renders as `GND`. The check is `is<const char*>()`, which does not verify the value is actually `"ground"`. | **fixed 2026-08-23** |
+| 6 | low | Altitudes beyond int32 (`alt_baro: 1e18`) wrap through `as<int32_t>()` to a value `<= 0` and render as `GND` rather than being rejected. | **fixed 2026-08-23** |
+| 7 | low | A genuine altitude of exactly **-1 ft** is indistinguishable from "absent" — both use `-1` — so it renders as an em-dash instead of `GND`. | **fixed 2026-08-23** |
+| 8 | low | `seen_pos: null` is treated as **fresh**: `as<double>()` yields `0`. Violates the function's own stated rule that unknown age must not be trusted (`containsKey` passes, the null does not). | **fixed 2026-08-23** |
+| 9 | low | ADS-B category `B2` (balloon/airship) falls through to the callsign rule and classifies **COM**. Only `A1/A7` map to PVT and `A3/A4/A5` to COM. | **fixed 2026-08-23** |
+| 10 | info | `CLAUDE.md` documents ArduinoJson **6.x**; the installed and linked library is **7.4.3**, where `StaticJsonDocument` is deprecated and heap-backed. The `// stack-allocated` and "no heap allocation" comments in `fetchClosestAt` are therefore inaccurate. | **fixed 2026-08-23** |
 
 ### Verified correct (no action needed)
 

@@ -63,20 +63,20 @@ CASES = [
     ("pos_ok",         ac(), {"showing_flight": True}, "fresh position accepted"),
     ("pos_no_seenpos", ac(seen_pos=...), {"showing_flight": False}, "missing seen_pos must be rejected"),
     ("pos_stale",      ac(seen_pos=9999), {"showing_flight": False}, "stale position must be rejected"),
-    ("pos_seenpos_null", ac(seen_pos=None), None, "null seen_pos — treated as fresh?"),
+    ("pos_seenpos_null", ac(seen_pos=None), {"showing_flight": False}, "null seen_pos is an unknown age, so rejected"),
     ("pos_zero",       ac(lat=0, lon=0), {"showing_flight": False}, "(0,0) must be rejected"),
     ("pos_missing",    ac(lat=..., lon=...), {"showing_flight": False}, "absent lat/lon rejected"),
     ("pos_antipode",   ac(lat=-47.65, lon=57.63), None, "far-side distance maths"),
 
     # --- altitude branches
-    ("alt_ground_str", ac(alt_baro="ground"), None, "alt_baro string 'ground'"),
-    ("alt_zero",       ac(alt_baro=0), None, "0 ft treated as on-ground"),
-    ("alt_negative",   ac(alt_baro=-250), None, "negative altitude treated as on-ground"),
-    ("alt_geom_only",  ac(alt_baro=..., alt_geom=17500), None, "alt_geom fallback"),
-    ("alt_absent",     ac(alt_baro=..., alt_geom=...), None, "no altitude at all"),
-    ("alt_numstring",  ac(alt_baro="12345"), None, "numeric string, not 'ground'"),
-    ("alt_huge",       ac(alt_baro=999999), None, "absurd altitude"),
-    ("alt_minus_one",  ac(alt_baro=-1), None, "-1 collides with the absent sentinel"),
+    ("alt_ground_str", ac(alt_baro="ground"), {"alt_ft": -2}, "alt_baro string 'ground' means on the surface"),
+    ("alt_zero",       ac(alt_baro=0), {"alt_ft": -2}, "0 ft means on the surface"),
+    ("alt_negative",   ac(alt_baro=-250), {"alt_ft": -2}, "negative altitude means on the surface"),
+    ("alt_geom_only",  ac(alt_baro=..., alt_geom=17500), {"alt_ft": 17500}, "alt_geom used when alt_baro is absent"),
+    ("alt_absent",     ac(alt_baro=..., alt_geom=...), {"alt_ft": -1}, "no altitude at all reads as unknown"),
+    ("alt_numstring",  ac(alt_baro="12345"), {"alt_ft": -1}, "a string that is not 'ground' is unknown, NOT ground"),
+    ("alt_huge",       ac(alt_baro=999999), {"alt_ft": -1}, "implausible altitude rejected as unknown"),
+    ("alt_minus_one",  ac(alt_baro=-1), {"alt_ft": -2}, "a PRESENT -1 is on the surface, not absent"),
 
     # --- type / description
     ("type_known",     ac(t="A320"), None, "known ICAO type"),
@@ -95,7 +95,7 @@ CASES = [
     ("cls_airliner",   ac(t="B738"), {"op": "COM"}, "airliner with callsign = commercial"),
     ("cls_nocallsign", ac(t="B738", flight=..., r=...), None, "airliner with no callsign"),
     ("cls_cat_a7",     ac(t=..., category="A7", desc=...), None, "rotorcraft category"),
-    ("cls_cat_b2",     ac(t=..., category="B2", desc=...), None, "balloon category"),
+    ("cls_cat_b2",     ac(t=..., category="B2", desc=...), {"op": "PVT"}, "balloon/airship is not commercial"),
 
     # --- malformed / structural
     ("bad_ac_object",  json.dumps({"ac": {"hex": "x"}}), {"showing_flight": False}, "ac is an object not an array"),
@@ -106,7 +106,7 @@ CASES = [
     ("bad_nulls",      json.dumps({"ac": [{k: None for k in BASE_AC}]}), {"showing_flight": False}, "every field null"),
     ("bad_deep",       json.dumps({"ac": [BASE_AC], "x": {"y": {"z": [1] * 50}}}), None, "extra deep/unfiltered data"),
     ("bad_many_ac",    json.dumps({"ac": [BASE_AC] * 40}), None, "40 aircraft vs the 2048-byte doc"),
-    ("bad_bignum",     ac(alt_baro=10**18), None, "value beyond int32"),
+    ("bad_bignum",     ac(alt_baro=10**18), {"alt_ft": -1}, "value beyond int32 rejected, not wrapped to ground"),
     ("bad_types",      ac(lat="47.65", lon="-122.37"), None, "lat/lon sent as strings"),
 ]
 
