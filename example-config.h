@@ -50,3 +50,7 @@
 // #define OTA_HOSTNAME "flight-display"
 // #define OTA_PORT 3232
 // #define OTA_PASSWORD "change-me"
+
+// adsb.lol rejects generic User-Agents with 403 — it wants real contact info.
+// Put your own email or project URL here before flashing.
+// #define API_USER_AGENT "flight-display/1.0 (ESP32 ADS-B display; you@example.com)"

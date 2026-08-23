@@ -61,6 +61,7 @@ struct FlightInfo {
 // Local function prototypes used before definitions
 static void relaysPowerOnly();
 static void showSplash(const char *msgTop, const char *msgBottom = nullptr);
+static void setDisplayDim(bool dim);
 static void drawCentered(const char *text, int16_t baselineY);
 
 // -----------------------------
@@ -208,6 +209,52 @@ static constexpr uint32_t MIL_LOOKUP_HARD_TIMEOUT_MS = 15000;  // absolute wall-
 #define PIXEL_SHIFT_INTERVAL_MS (3UL * 60UL * 1000UL)  // 3 minutes per step
 #endif
 
+// Reset reason as text — printed at boot and served by /healthz, so a soak run
+// can tell a clean power cycle from a panic or watchdog reboot after the fact.
+#if defined(ESP32)
+static const char *resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON: return "POWERON";
+    case ESP_RST_EXT: return "EXT";
+    case ESP_RST_SW: return "SW";
+    case ESP_RST_PANIC: return "PANIC";
+    case ESP_RST_INT_WDT: return "INT_WDT";
+    case ESP_RST_TASK_WDT: return "TASK_WDT";
+    case ESP_RST_WDT: return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    case ESP_RST_SDIO: return "SDIO";
+    default: return "UNKNOWN";
+  }
+}
+#endif
+
+// adsb.lol returns 403 "User-Agent too generic; include valid contact info."
+// for anonymous-looking clients. Real contact string lives in config.h (gitignored).
+#ifndef API_USER_AGENT
+#define API_USER_AGENT "flight-display/1.0 (ESP32 ADS-B display; set API_CONTACT in config.h)"
+#endif
+
+// Display brightness (SSD1322 contrast register, 0-255). Splash screens are
+// static for as long as the outage lasts, so they run dimmed to cut burn-in.
+#ifndef DISPLAY_CONTRAST
+#define DISPLAY_CONTRAST 255
+#endif
+#ifndef DISPLAY_CONTRAST_DIM
+#define DISPLAY_CONTRAST_DIM (DISPLAY_CONTRAST / 4)  // 75% dimmer
+#endif
+
+// ponytail: two levels, no fade ramp — add easing only if the step is jarring
+static bool g_displayDim = false;
+static void setDisplayDim(bool dim) {
+  static int8_t s_dim = -1;  // -1 = never applied, force the first write
+  if (s_dim == (int8_t)dim) return;
+  s_dim = dim;
+  g_displayDim = dim;
+  u8g2.setContrast(dim ? DISPLAY_CONTRAST_DIM : DISPLAY_CONTRAST);
+  LOG_INFO("Display contrast -> %d", dim ? DISPLAY_CONTRAST_DIM : DISPLAY_CONTRAST);
+}
+
 // Wider search radius tried only when the primary radius is empty, so the
 // display always shows the nearest aircraft when anything is in range.
 // Costs one extra API call per cycle only while the primary circle is quiet.
@@ -221,6 +268,12 @@ static uint32_t backoffMs(uint8_t attempt, uint32_t base = 2000, uint32_t cap = 
   uint32_t jitter = (exp >> 3) * (esp_random() & 0x7) / 7;  // ~±12.5% jitter
   return min(cap, exp + jitter);
 }
+// Lifetime counters for the health endpoint — cheap, and the only way to see
+// slow drift (failure ratio, empty-sky ratio) over a multi-day soak.
+static uint32_t g_statOk = 0, g_statEmpty = 0, g_statFail = 0;
+static int g_statLastHttp = 0;
+static char g_statErrBuf[96] = "";
+static const char *g_statLastErr = "";
 static uint8_t g_fetchFailCount = 0;
 static uint32_t g_nextFetchAt = 0;
 static uint32_t g_lastDataMs = 0;  // millis() of last successful fetch with data
@@ -277,6 +330,10 @@ static MilCacheEntry g_milCache[MIL_CACHE_SIZE];  // BSS zero-init; .valid=false
 #define TEST_OVERRIDE_TTL_MS (5UL * 60UL * 1000UL)  // 5 minutes
 #endif
 
+// Declared ahead of the HTTP handlers so /healthz can report what's on screen
+static bool g_haveDisplayed = false;
+static FlightInfo g_lastShown;
+
 #if FEATURE_TEST_ENDPOINT
 static WebServer g_http(80);
 static bool g_httpStarted = false;
@@ -289,6 +346,37 @@ struct TestOverride {
 
 static void httpHandleRoot() {
   g_http.send(200, "text/plain", "OK");
+}
+
+// Machine-readable telemetry for the soak monitor. Everything here is something
+// that drifts or breaks over days: heap, reboots, Wi-Fi, and the fetch outcome mix.
+static void httpHandleHealth() {
+  StaticJsonDocument<640> d;
+  d["uptime_ms"] = millis();
+  d["reset_reason"] = resetReasonStr();
+  d["heap_free"] = ESP.getFreeHeap();
+  d["heap_min"] = ESP.getMinFreeHeap();
+  d["heap_largest_block"] = ESP.getMaxAllocHeap();
+  d["wifi_up"] = (WiFi.status() == WL_CONNECTED);
+  d["rssi"] = WiFi.RSSI();
+  d["ip"] = WiFi.localIP().toString();
+  d["fetch_ok"] = g_statOk;
+  d["fetch_empty"] = g_statEmpty;
+  d["fetch_fail"] = g_statFail;
+  d["fail_streak"] = g_fetchFailCount;
+  d["last_http"] = g_statLastHttp;
+  d["last_err"] = g_statLastErr;
+  d["last_data_age_ms"] = g_lastDataMs ? (millis() - g_lastDataMs) : -1;
+  d["next_fetch_in_ms"] = (int32_t)(g_nextFetchAt - millis());
+  d["showing_flight"] = g_haveDisplayed;
+  d["display_dim"] = g_displayDim;
+  d["ident"] = (const char*)g_lastShown.ident;
+  d["type"] = (const char*)g_lastShown.typeCode;
+  d["op"] = (const char*)g_lastShown.opClass;
+  d["test_override"] = g_test.active && (int32_t)(millis() - g_test.expiresAt) < 0;
+  String out;
+  serializeJson(d, out);
+  g_http.send(200, "application/json", out);
 }
 
 static void httpHandleGetClosest() {
@@ -358,7 +446,7 @@ static void httpHandleDeleteClosest() {
 static void httpStartOnce() {
   if (g_httpStarted) return;
   g_http.on("/", HTTP_GET, httpHandleRoot);
-  g_http.on("/healthz", HTTP_GET, httpHandleRoot);
+  g_http.on("/healthz", HTTP_GET, httpHandleHealth);
   g_http.on("/test/closest", HTTP_GET, httpHandleGetClosest);
   g_http.on("/test/closest", HTTP_PUT, httpHandlePutClosest);
   g_http.on("/test/closest", HTTP_DELETE, httpHandleDeleteClosest);
@@ -430,8 +518,10 @@ static bool fetchIsMilitaryByHex(const char* hex, bool &isMilOut) {
   }
   http.addHeader("Accept", "application/json");
   http.addHeader("Accept-Encoding", "identity");
-  http.addHeader("Connection", "close");
-  http.addHeader("User-Agent", "ESP32-FlightDisplay/1.0");
+  // setUserAgent, not addHeader: HTTPClient always writes its own User-Agent and
+  // Connection lines, so addHeader sent a duplicate UA and adsb.lol read the
+  // generic "ESP32HTTPClient" one and 403'd us.
+  http.setUserAgent(API_USER_AGENT);
 
   int code = http.GET();
   LOG_INFO("HTTP status (mil): %d", code);
@@ -554,8 +644,6 @@ static void otaBeginOnce() {
 // (moved earlier)
 
 // Shared display state so network and test endpoints can update consistently
-static bool g_haveDisplayed = false;
-static FlightInfo g_lastShown;
 
 // Resolve military status via cache or network fetch. Must be called before
 // classifyOp() so the cache is populated. This is the only function that
@@ -673,6 +761,7 @@ static void showSplash(const char *msgTop, const char *msgBottom) {
     drawCentered(msgBottom, base);
   }
 
+  setDisplayDim(true);
   u8g2.sendBuffer();
 }
 
@@ -834,13 +923,24 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out) {
   }
   http.addHeader("Accept", "application/json");
   http.addHeader("Accept-Encoding", "identity");
-  http.addHeader("Connection", "close");
-  http.addHeader("User-Agent", "ESP32-FlightDisplay/1.0");
+  // setUserAgent, not addHeader: HTTPClient always writes its own User-Agent and
+  // Connection lines, so addHeader sent a duplicate UA and adsb.lol read the
+  // generic "ESP32HTTPClient" one and 403'd us.
+  http.setUserAgent(API_USER_AGENT);
 
   int code = http.GET();
+  g_statLastHttp = code;
   LOG_INFO("HTTP status: %d", code);
   if (code != HTTP_CODE_OK) {
     LOG_WARN("HTTP error: %s", http.errorToString(code).c_str());
+    if (code > 0) {
+      String body = http.getString();
+      if (body.length() > 200) body.remove(200);
+      LOG_WARN("HTTP body: %s", body.c_str());
+      strncpy(g_statErrBuf, body.c_str(), sizeof(g_statErrBuf) - 1);
+      g_statErrBuf[sizeof(g_statErrBuf) - 1] = '\0';
+      g_statLastErr = g_statErrBuf;
+    }
     http.end();
     return FETCH_FAIL;
   }
@@ -988,6 +1088,7 @@ static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) 
 }
 
 static void renderFlight(const FlightInfo &fi) {
+  setDisplayDim(false);
   u8g2.clearBuffer();
   u8g2.setDrawColor(1);
 
@@ -1099,21 +1200,8 @@ void setup() {
   delay(20);
   Serial.println(F("\n[Boot] Flight Display starting..."));
 #if defined(ESP32)
-  auto rr = esp_reset_reason();
   Serial.print(F("[Boot] Reset reason: "));
-  switch (rr) {
-    case ESP_RST_POWERON: Serial.println(F("POWERON")); break;
-    case ESP_RST_EXT: Serial.println(F("EXT")); break;
-    case ESP_RST_SW: Serial.println(F("SW")); break;
-    case ESP_RST_PANIC: Serial.println(F("PANIC")); break;
-    case ESP_RST_INT_WDT: Serial.println(F("INT_WDT")); break;
-    case ESP_RST_TASK_WDT: Serial.println(F("TASK_WDT")); break;
-    case ESP_RST_WDT: Serial.println(F("WDT")); break;
-    case ESP_RST_DEEPSLEEP: Serial.println(F("DEEPSLEEP")); break;
-    case ESP_RST_BROWNOUT: Serial.println(F("BROWNOUT")); break;
-    case ESP_RST_SDIO: Serial.println(F("SDIO")); break;
-    default: Serial.println((int)rr); break;
-  }
+  Serial.println(resetReasonStr());
 #endif
   // Wi‑Fi event logging and dynamic power management
   WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -1228,6 +1316,7 @@ void loop() {
     FlightInfo nearest;
     FetchResult fr = fetchNearestFlight(nearest);
     if (fr == FETCH_OK) {
+      g_statOk++;
       g_fetchFailCount = 0;
       g_lastDataMs = millis();
       g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
@@ -1238,6 +1327,7 @@ void loop() {
         relaysShowCategory(g_lastShown.opClass);
       }
     } else if (fr == FETCH_EMPTY) {
+      g_statEmpty++;
       // API healthy, sky quiet: normal interval, no failure count, and don't
       // keep showing an aircraft the API says is no longer there
       g_fetchFailCount = 0;
@@ -1248,6 +1338,7 @@ void loop() {
       }
       showSplash("No aircraft nearby");
     } else {
+      g_statFail++;
       // Wi-Fi outages don't feed the restart breaker — the reconnect logic
       // owns those; the breaker is for "API unreachable despite Wi-Fi up"
       if (WiFi.status() == WL_CONNECTED) {
