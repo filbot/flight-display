@@ -135,13 +135,24 @@ SERIAL_FLAGS = [
 ]
 
 
-def report_serial(tail):
+def report_serial(tail, since=None):
     path = os.path.join(LOGDIR, "serial.log")
     if not os.path.exists(path):
         print("\nno serial log")
         return
     with open(path, errors="replace") as f:
         lines = f.readlines()
+    if since:
+        # Must honour --since here too: without it, long-fixed problems keep
+        # showing up in a one-hour window and read as current failures.
+        kept = []
+        for ln in lines:
+            try:
+                if parse_ts(ln.split(" ", 1)[0]) >= since:
+                    kept.append(ln)
+            except (ValueError, IndexError):
+                continue
+        lines = kept
     counts, samples = {}, {}
     for ln in lines:
         for rx, tag in SERIAL_FLAGS:
@@ -149,7 +160,7 @@ def report_serial(tail):
                 counts[tag] = counts.get(tag, 0) + 1
                 samples.setdefault(tag, []).append(ln.rstrip())
                 break
-    print(f"\nSERIAL      {len(lines)} lines")
+    print(f"\nSERIAL      {len(lines)} lines" + ("  (windowed)" if since else ""))
     for tag in sorted(counts, key=lambda t: -counts[t]):
         print(f"  {tag:<15} {counts[tag]}")
     for tag in ("CRASH", "RESTART", "MIL_INCOMPLETE"):
@@ -164,7 +175,7 @@ def main():
     a = ap.parse_args()
     since = datetime.now(timezone.utc) - timedelta(hours=a.since) if a.since else None
     report_health(load_health(since))
-    report_serial(a.tail)
+    report_serial(a.tail, since)
 
 
 if __name__ == "__main__":
