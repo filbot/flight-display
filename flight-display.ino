@@ -63,6 +63,7 @@ struct FlightInfo {
 static void relaysPowerOnly();
 static void showSplash(const char *msgTop, const char *msgBottom = nullptr);
 static void setDisplayDim(bool dim);
+static bool resolveFriendlyName(const FlightInfo &fi, char* buf, size_t bufSize);
 static void drawCentered(const char *text, int16_t baselineY);
 
 // -----------------------------
@@ -371,6 +372,16 @@ static void httpHandleHealth() {
   d["next_fetch_in_ms"] = (int32_t)(g_nextFetchAt - millis());
   d["showing_flight"] = g_haveDisplayed;
   d["display_dim"] = g_displayDim;
+  d["alt_ft"] = g_lastShown.altitudeFt;
+  d["dist_km"] = isnan(g_lastShown.distanceKm) ? -1.0 : g_lastShown.distanceKm;
+  d["has_callsign"] = g_lastShown.hasCallsign;
+  d["db_flags"] = g_lastShown.dbFlags;
+  d["category"] = (const char*)g_lastShown.category;
+  {
+    char title[64];
+    resolveFriendlyName(g_lastShown, title, sizeof(title));
+    d["title"] = title;
+  }
   d["ident"] = (const char*)g_lastShown.ident;
   d["type"] = (const char*)g_lastShown.typeCode;
   d["op"] = (const char*)g_lastShown.opClass;

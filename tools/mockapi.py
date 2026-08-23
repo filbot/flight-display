@@ -22,6 +22,7 @@ can change behaviour mid-flight without restarting the server. Modes:
     garbage     200 with binary junk
     bigmil      /v2/mil returns a very large body
     mil         aircraft with dbFlags=1, must classify as MIL
+    custom      serves the raw bytes of logs/mock.body verbatim (any payload)
 """
 import argparse, json, os, ssl, subprocess, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOGDIR = os.environ.get("LOGDIR", os.path.join(ROOT, "logs"))
 MODE_FILE = os.path.join(LOGDIR, "mock.mode")
+BODY_FILE = os.path.join(LOGDIR, "mock.body")
 CERT = os.path.join(LOGDIR, "mock-cert.pem")
 KEY = os.path.join(LOGDIR, "mock-key.pem")
 SLOW_SECONDS = 40  # must exceed the firmware's HTTP_READ_TIMEOUT_MS (30s)
@@ -102,6 +104,14 @@ class Handler(BaseHTTPRequestHandler):
             # Content-Length promises the whole body; the client must notice the
             # stream ended early rather than parsing whatever arrived.
             return self._send(200, cut, clen=len(body))
+        if m == "custom":
+            # Arbitrary payload written by tools/probe.py — lets every parse
+            # branch be driven without a firmware change or a new mode.
+            try:
+                with open(BODY_FILE, "rb") as f:
+                    return self._send(200, f.read())
+            except OSError:
+                return self._send(500, "no body file\n", "text/plain")
         if m == "mil":
             # dbFlags bit 0 is the only military signal the firmware has left,
             # so this is the regression test for removing the /v2/mil scan.
