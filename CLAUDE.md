@@ -27,6 +27,9 @@ Display driver: `U8G2_SSD1322_NHD_256X64_F_4W_HW_SPI` with full framebuffer.
 | `log.h` | Leveled logging macros: `LOG_ERROR`, `LOG_WARN`, `LOG_INFO`, `LOG_DEBUG` with compile-time `LOG_LEVEL` |
 | `AGENTS.md` | AI agent operating guide (ESP32 firmware conventions) |
 | `README.md` | Project documentation, hardware setup, API details |
+| `tools/monitor.sh` | Detached soak monitor: serial capture + 60s `/healthz` poll into gitignored `logs/` |
+| `tools/report.py` | Summarizes a soak run: reboots, heap drift, Wi-Fi, fetch mix, no-data stretches |
+| `tools/harness.py` | Injects display edge cases via `PUT /test/closest`; `soak` mode cycles them unattended |
 
 ## Build
 
@@ -102,6 +105,8 @@ Examples:
 - **Display rendering**: Font cascade (32pt → 24pt → 20pt → 10pt → 9pt → 6pt) with 2-line word wrapping. Bottom bar: distance | seats | altitude in 3 equal cells.
 - **Relay mapping**: Status=IN1, PVT=IN2, COM=IN3, MIL=IN4 (configurable via `RELAY_*_PIN`)
 - **Test override**: `PUT /test/closest` with JSON body to inject test flight data (5-min TTL)
+- **Health**: `GET /healthz` returns JSON telemetry (uptime, reset reason, heap free/min/largest-block, RSSI, fetch ok/empty/fail counters, last HTTP status and error body, last-data age, what's on screen, dim state). `GET /` stays plain `OK`.
+- **Display dimming**: splash screens run at `DISPLAY_CONTRAST_DIM` (default 25% of `DISPLAY_CONTRAST`) to limit OLED burn-in during outages; `renderFlight()` restores full brightness. Driven from one call site each, so any new splash inherits it.
 
 ## Gotchas
 
@@ -112,3 +117,8 @@ Examples:
 - `client.setInsecure()` — no TLS cert verification (standard for ESP32 IoT)
 - `alt_baro` is a number in feet OR the string `"ground"` — parsed to the `ALT_GROUND` sentinel (-2), rendered as `GND`
 - Duplicate ICAO variants (freighter/winglet) must NOT be added back to `kTypeInfo[]` — the `t` field can't distinguish them, and binary search requires unique sorted keys
+- **Never `addHeader("User-Agent", ...)` or `addHeader("Connection", ...)`** — ESP32 `HTTPClient` writes both lines itself (`HTTPClient.cpp:1150`), so `addHeader` sends a *duplicate* header and the server may read the built-in generic one. Use `http.setUserAgent()`, which replaces it.
+- adsb.lol returns **403 with body `User-Agent too generic; include valid contact info.`** for anonymous-looking clients. `API_USER_AGENT` must carry a real email or project URL and is set in `config.h` (gitignored). The same request from a laptop can return 200 while the device gets 403, so don't test this with curl alone — read the device's own error body.
+- Non-2xx API responses: always log `http.getString()` (bounded). The status code alone hid this 403's cause completely.
+- `arduino-cli monitor` **exits immediately when stdin is not a TTY**, so it cannot be used for detached/background logging. Read the port directly, holding the fd open with `exec 3<>` so the `stty` settings survive (each fresh open resets the port to 9600 on macOS).
+- **Opening the USB serial port reboots the board** (DTR toggle). A reset logged at the moment a monitor attaches is an artifact, not a fault. USB flashing and serial logging contend for the port — stop the logger or flash via OTA.
