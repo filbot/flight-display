@@ -6,6 +6,59 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-24 05:20-12:56 UTC: first clean observational baseline (7.6h)
+
+No synthetic fault injection, no mock, no test override — verified: `overnight.log`
+has no entries in the window, zero mock requests, and all 845 samples used
+`api.adsb.lol`. So everything below is real-world behaviour.
+
+**The device rebooted twice on its own.** That is the headline, and it is new.
+
+### New findings
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 16 | **high** | **The task watchdog fired twice in production** (08:51:34, 09:39:53), both times with `loopTask (CPU 1)` blocked inside an `HTTP GET` and both CPUs idle — waiting on network I/O, not spinning. Worst *surviving* iteration was **22,217 ms** against the 25,000 ms watchdog. My earlier margin estimate in finding #11 was **wrong**: it assumed ~16s worst case, but DNS (up to 15s, finding #14) happens *inside* `http.begin()` on top of connect (8s) and read (8s), and the tiered fallback can issue **two** fetches in a single `loop()` iteration. Worst case is therefore ~31s for one fetch and roughly double that for a widened search — comfortably past the watchdog. | open |
+| 17 | medium | **The local-receiver refresh misses 70% of the time** (893 ok vs 2,087 miss, 0 fail). Cause: overnight the nearby sky is empty, so 61% of displayed aircraft came from the 100 km fallback (median distance 14.1 km, max 23.9 km) and are not heard locally with a fresh position. Each miss still costs a full fetch and 16 KB parse. | open |
+| 18 | medium | **The local fetch costs p50 120 ms / p95 310 ms / max 1572 ms** on device against 27 ms measured with curl. The gap is the 16 KB JSON parse on a 240 MHz MCU, not the network. At a 4 s interval that is ~3% of wall clock spent parsing to extract one aircraft's position. | open |
+| 19 | low | `nightreport.py`'s "Suite results" section ignored `--since` and read the whole `overnight.log`, so a night with **no** test runs reported 15 passes from previous days — making a clean baseline look contaminated. | **fixed 2026-08-24** |
+
+### Reliability, measured
+
+- **Heap is excellent**: -17 bytes half-vs-half drift over 7.6h, min-ever 140,168
+  (9x the 15,000 critical threshold), largest block flat at 110,580. No leak, no
+  fragmentation trend.
+- **Wi-Fi is excellent**: zero `wifi_up=false` samples, RSSI -56/-47/-40 dBm.
+- **Fetch outcomes** since the last boot: 373 ok, 13 empty, 5 fail.
+- 22 of 869 health samples unreachable (2.5%), scattered rather than clustered,
+  coinciding with the long blocking windows rather than forming outages.
+- **API latency degraded overnight**: p50 966 ms but p95 **2,885 ms** and max
+  **16,602 ms**, against a p95 of 1,230 ms measured the previous afternoon. Not
+  ours to fix, but it is what pushed loop iterations past the watchdog — the
+  timeouts were sized against a faster network than we actually got.
+
+### Performance, measured
+
+- Loop runs at **885 iterations/s** (24.1 M over 7.6h). Renders are cheap and
+  not a problem: 3,850 (8.5/min), worst **17 ms**.
+- Blocking: 7,101 iterations >50 ms, 897 >500 ms, 67 >5 s. Lower bound on time
+  spent blocked is **1,060 s = 3.9% of wall clock**, essentially all of it in
+  HTTP fetches.
+- The tiered fallback widened **522 times** in the window — for 61% of the night
+  the device made **two** API calls per cycle instead of one, doubling both the
+  API load and the per-iteration blocking window. This is the direct mechanism
+  behind the 08:51 watchdog trip, whose log line immediately before the abort was
+  `Nothing within 10 km, widening to 100 km`.
+
+### What the data does NOT support
+
+- No heap leak, no fragmentation growth, no Wi-Fi instability, no display or
+  render cost problem, and no evidence of any fault in the alert, classification
+  or parse paths. The only reliability defect found is #16.
+
+---
+
+
 ## 2026-08-24: local ADS-B receiver feeds the live numbers
 
 Filip runs PiAware on the roof. It serves dump1090 `aircraft.json` at

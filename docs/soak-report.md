@@ -1,74 +1,52 @@
 # Flight Display — soak report
 
-Generated 2026-08-23 13:59 UTC · window: last 9h
+Generated 2026-08-24 12:59 UTC · window: last 8h
 
 ## Run summary
 
-- Window `2026-08-23T05:00:24Z` → `2026-08-23T13:59:32Z` (8:59:08), 538 health samples, 1 unreachable (0.2%).
-- Uptime now 30292s, last reset `SW`; 2 reboot(s) observed in window.
-  - `2026-08-23T05:06:35Z` reason `SW`
-  - `2026-08-23T05:34:50Z` reason `SW`
-- Heap: now 195620, min-ever 119852, largest block 110580, half-vs-half drift +38 bytes.
-- Wi-Fi: RSSI min -47 / avg -43 / max -41 dBm, 0 sample(s) with the link down.
-- Fetch counters (lifetime since last boot): ok 1285, empty 153, fail 158.
+- Window `2026-08-24T05:00:30Z` → `2026-08-24T12:59:54Z` (7:59:24), 892 health samples, 22 unreachable (2.5%).
+- Uptime now 12759s, last reset `TASK_WDT`; 3 reboot(s) observed in window.
+  - `2026-08-24T05:20:32Z` reason `SW`
+  - `2026-08-24T08:52:04Z` reason `TASK_WDT`
+  - `2026-08-24T09:27:49Z` reason `TASK_WDT`
+- Heap: now 198432, min-ever 140168, largest block 110580, half-vs-half drift -15 bytes.
+- Wi-Fi: RSSI min -56 / avg -47 / max -40 dBm, 0 sample(s) with the link down.
+- Fetch counters (lifetime since last boot): ok 376, empty 13, fail 5.
 
 ## Crashes and watchdog
 
-- 0 crash/watchdog line(s) in the serial window.
+- 16 crash/watchdog line(s) in the serial window.
+  - `2026-08-24T09:39:53Z E (2148735) task_wdt: CPU 0: IDLE0`
+  - `2026-08-24T09:39:53Z E (2148735) task_wdt: CPU 1: IDLE1`
+  - `2026-08-24T09:39:53Z E (2148735) task_wdt: Aborting.`
+  - `2026-08-24T09:39:53Z E (2148735) task_wdt: Print CPU 1 backtrace`
+  - `2026-08-24T09:39:53Z Backtrace: 0x4008b77b:0x3ffcd890 0x401a98c9:0x3ffcd8b0 0x4008f4c7:0x3ffcd8d0 0x4008e4cd:0x3ffcd8f0`
 
 ## Measured latency
 
-- 2322 request(s): p50 933ms, p95 1204ms, max 13568ms.
+- 1410 request(s): p50 974ms, p95 4007ms, max 16712ms.
 
 ## Data-path probe matrix
 
-- 730 case-runs over 48 distinct cases: 299 pass, 7 fail.
-  - `bad_ac_object` failed 1/15 run(s); last mismatch: `{'showing_flight': [False, True]}`
-  - `ident_empty` failed 1/15 run(s); last mismatch: `{'ident': ['N123AB', '']}`
-  - `ident_flight` failed 1/15 run(s); last mismatch: `{'ident': ['TEST123', 'SKW4100']}`
-  - `ident_hex` failed 1/15 run(s); last mismatch: `{'ident': ['abc123', 'N123AB']}`
-  - `pos_no_seenpos` failed 2/21 run(s); last mismatch: `{'showing_flight': [False, True]}`
-  - `pos_zero` failed 1/15 run(s); last mismatch: `{'showing_flight': [False, True]}`
-
-Observed behaviour for the exploratory cases (latest run of each):
-
-| case | ident | op | title | alt_ft | shown |
-|---|---|---|---|---|---|
-| `alt_absent` | `'TEST123'` | COM | Boeing 737-800 | -1 | True |
-| `alt_geom_only` | `'TEST123'` | COM | Boeing 737-800 | 17500 | True |
-| `alt_ground_str` | `'TEST123'` | COM | Boeing 737-800 | -2 | True |
-| `alt_huge` | `'TEST123'` | COM | Boeing 737-800 | 999999 | True |
-| `alt_minus_one` | `'TEST123'` | COM | Boeing 737-800 | -1 | True |
-| `alt_negative` | `'TEST123'` | COM | Boeing 737-800 | -2 | True |
-| `alt_numstring` | `'TEST123'` | COM | Boeing 737-800 | -2 | True |
-| `alt_zero` | `'TEST123'` | COM | Boeing 737-800 | -2 | True |
-| `bad_bignum` | `'TEST123'` | COM | Boeing 737-800 | -2 | True |
-| `bad_deep` | `'TEST123'` | COM | Boeing 737-800 | 30000 | True |
-| `bad_many_ac` | `'TEST123'` | COM | Boeing 737-800 | 30000 | True |
-| `bad_types` | `'TEST123'` | COM | Boeing 737-800 | 30000 | True |
-| `cls_cat_a7` | `'TEST123'` | PVT | Unknown Aircraft | 30000 | True |
-| `cls_cat_b2` | `'TEST123'` | COM | Unknown Aircraft | 30000 | True |
-| `cls_dbflags_str` | `'TEST123'` | MIL | Boeing 737-800 | 30000 | True |
-| `cls_ladd` | `'TEST123'` | COM | Boeing 737-800 | 30000 | True |
-| `cls_nocallsign` | `'abc123'` | COM | Boeing 737-800 | 30000 | True |
-| `ident_long` | `'ABCDEFGHIJKLMNO'` | COM | Boeing 737-800 | 30000 | True |
-| `ident_unicode` | `'ÜNI✈CODE'` | COM | Boeing 737-800 | 30000 | True |
-| `ident_ws_only` | `''` | COM | Boeing 737-800 | 30000 | True |
-| `pos_antipode` | `'TEST123'` | COM | Boeing 737-800 | 30000 | True |
-| `pos_seenpos_null` | `'TEST123'` | COM | Boeing 737-800 | 30000 | True |
-| `type_absent` | `'TEST123'` | COM | BOEING 737-800 | 30000 | True |
-| `type_known` | `'TEST123'` | COM | Airbus A320 | 30000 | True |
-| `type_long` | `'TEST123'` | COM | BOEING 737-800 | 30000 | True |
-| `type_nodesc` | `'TEST123'` | COM | ZZZZ | 30000 | True |
-| `type_prefix` | `'TEST123'` | COM | Boeing 777-200LR | 30000 | True |
-| `type_unknown` | `'TEST123'` | COM | BOEING 737-800 | 30000 | True |
 
 ## Suite results
 
-- fault scenarios: 13 run(s), most recent `10/10`, worst `10/10`.
-- display cases: 13 run(s), most recent `15/15`, worst `15/15`.
-- probe passes: 13 run(s), most recent `18/2`, worst `18/2`.
-- 13 complete overnight pass(es).
+- fault scenarios: 15 run(s), most recent `10/10`, worst `9/10`.
+- display cases: 15 run(s), most recent `15/15`, worst `15/15`.
+- probe passes: 15 run(s), most recent `9/14`, worst `9/14`.
+- 0 complete overnight pass(es).
+
+## Performance
+
+- Loop: 24,284,924 iterations over 7.6h = **886/s**. Worst single iteration seen: **22217 ms** (task watchdog fires at 25000 ms).
+  - iterations >50ms: 7,128 (15.6/min)
+  - iterations >500ms: 900 (2.0/min)
+  - iterations >5s: 67 (0.1/min)
+- Renders: 3,878 (8.5/min), worst **17 ms**.
+- API fetch: worst **16711 ms**, last 1010 ms.
+- Local receiver fetch: worst **1572 ms**, last 122 ms.
+  - outcomes: ok 917, miss 2,087, fail 0 (0.0% fail)
+- Blocking budget: the loop runs at ~886/s, so anything over 50 ms is an outlier; 7,128 occurred in 7.6h.
 
 ## Findings
 

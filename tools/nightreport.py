@@ -176,7 +176,20 @@ def main():
     W("## Suite results\n")
     olog = os.path.join(LOGDIR, "overnight.log")
     if os.path.exists(olog):
-        txt = open(olog, errors="replace").read()
+        # Must honour --since like every other section: reading the whole file
+        # made a night with NO test runs report 15 passes from previous days,
+        # which read as a contaminated baseline.
+        lines = []
+        for ln in open(olog, errors="replace"):
+            try:
+                if since and ts(ln.split(" ", 1)[0]) < since:
+                    continue
+            except (ValueError, IndexError):
+                pass
+            lines.append(ln)
+        txt = "".join(lines)
+        if not txt.strip():
+            W("- No test suites ran in this window (clean observational baseline).")
         for label, pat in (("fault scenarios", r"(\d+)/(\d+) scenarios behaved correctly"),
                            ("display cases", r"(\d+)/(\d+) cases applied cleanly"),
                            ("probe passes", r"(\d+) pass, (\d+) FAIL")):
