@@ -279,12 +279,16 @@ def t_uses_point_endpoint(mock):
     force_fetch(mock)
     wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1, timeout=90)
     got = [r["path"] for r in reqs_since(mark) if "/v2/" in r["path"]]
-    primary = [p for p in got if "/point/" in p]
-    fallback = [p for p in got if "/closest/" in p]
-    ok = bool(primary) and bool(fallback)
+    point = [p for p in got if "/point/" in p]
+    closest = [p for p in got if "/closest/" in p]
+    # BOTH searches must use /v2/point. A single-aircraft /v2/closest response
+    # can fail the position-freshness gate, which declared the whole ring empty
+    # and showed "No aircraft nearby" over a busy sky — and it also silently
+    # disabled emergency scanning in the widened ring.
+    ok = bool(point) and not closest
     check("uses_point_endpoint", ok,
-          f"point requests {len(primary)}, closest requests {len(fallback)}; {got[:3]}",
-          "primary circle uses /v2/point, widened fallback stays on /v2/closest")
+          f"point requests {len(point)}, closest requests {len(closest)}; {got[:3]}",
+          "both the primary and widened searches scan all aircraft, not just the nearest")
     set_mode("ok")
 
 

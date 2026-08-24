@@ -449,6 +449,10 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 #endif
 
 // Declared ahead of the HTTP handlers so /healthz can report what's on screen
+// Why a fetch came back empty: how many aircraft the API sent, and how many
+// we rejected on position or staleness. Logged identically before, which made
+// a genuinely clear sky indistinguishable from us discarding everything.
+static int g_lastAcReturned = 0, g_lastAcRejected = 0;
 // Performance counters. The central question on this device is what blocks
 // loop() and for how long: OTA, the HTTP server and the display all live there,
 // and the task watchdog fires at 25s. Measured as the interval between
@@ -516,6 +520,8 @@ static void httpHandleHealth() {
   d["local_miss"] = g_statLocalMiss;
   d["local_fail"] = g_statLocalFail;
   d["local_skip"] = g_statLocalSkip;
+  d["last_ac_returned"] = g_lastAcReturned;
+  d["last_ac_rejected"] = g_lastAcRejected;
   d["local_seen_pos"] = g_localSeenPos;
 #endif
   d["wifi_drop_active"] = (g_wifiDropUntil != 0);
@@ -1118,6 +1124,8 @@ class PatientStream : public Stream {
 // whole reason for fetching every aircraft in the circle is to notice one.
 // Among several emergencies the nearest wins.
 static FlightInfo selectAircraft(JsonVariant root) {
+  g_lastAcReturned = 0;
+  g_lastAcRejected = 0;
   FlightInfo best;            // nearest valid aircraft
   FlightInfo alerted;         // best alerting aircraft, by priority then distance
   uint8_t alertedPri = 0;
@@ -1126,8 +1134,9 @@ static FlightInfo selectAircraft(JsonVariant root) {
   if (!robj.containsKey("ac") || !robj["ac"].is<JsonArray>()) return best;
 
   for (JsonObject obj : robj["ac"].as<JsonArray>()) {
+    g_lastAcReturned++;
     FlightInfo fi = parseAircraft(obj);
-    if (!fi.valid || isnan(fi.distanceKm)) continue;
+    if (!fi.valid || isnan(fi.distanceKm)) { g_lastAcRejected++; continue; }
     if (!best.valid || fi.distanceKm < best.distanceKm) best = fi;
 
     const AlertLevel* a = alertFor(fi.squawk, fi.emergency);
@@ -1298,8 +1307,11 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
     out = closest;
     return FETCH_OK;
   }
-  // Valid API response but no displayable aircraft (empty, or position too stale)
-  LOG_INFO("No valid aircraft found in response");
+  // "Empty" has two very different causes and they were logged identically,
+  // making it impossible to tell afterwards whether the sky really was clear or
+  // whether we rejected everything the API sent.
+  LOG_INFO("No displayable aircraft: %d returned, %d rejected on position/staleness",
+           g_lastAcReturned, g_lastAcRejected);
   return FETCH_EMPTY;
 }
 
@@ -1433,6 +1445,15 @@ static void refreshFromLocalReceiver() {
 // Primary radius first; widen only when the nearby sky is empty, so the
 // display always has an aircraft when anything is in range while keeping
 // the common case at one API call per cycle.
+// The radius the primary search actually covers. SEARCH_RADIUS_KM is converted
+// to whole nautical miles for the API, so the real circle is smaller than the
+// configured value and the two must not be used interchangeably.
+static double primaryQueryRadiusKm() {
+  int nm = (int)(SEARCH_RADIUS_KM * 0.5399568 + 0.5);
+  if (nm < 1) nm = 1;
+  return nm / 0.5399568;
+}
+
 // Sticky wide mode. Overnight the nearby sky is empty for hours, and the old
 // logic paid TWO API calls every cycle to rediscover that — 522 widenings in a
 // 7.6h window, doubling both the API load and the per-iteration blocking that
@@ -1449,7 +1470,12 @@ static FetchResult fetchNearestFlight(FlightInfo &out) {
     // ring is small then — measured 9.7 KB / 20 aircraft, against 44 KB / 95 at
     // midday when the primary circle is busy and wide mode never runs.
     FetchResult fr = fetchClosestAt(SEARCH_RADIUS_FALLBACK_KM, out, /*allAircraft=*/true);
-    if (fr == FETCH_OK && out.distanceKm <= SEARCH_RADIUS_KM) {
+    // Compare against the radius actually QUERIED, with hysteresis. The API
+    // takes integer nautical miles, so a 10 km setting is sent as 5 nm = 9.26 km:
+    // an aircraft in the 9.26-10 km band is invisible to the primary search yet
+    // passed a `<= SEARCH_RADIUS_KM` test, so wide mode toggled every single
+    // cycle and paid for two searches instead of one.
+    if (fr == FETCH_OK && out.distanceKm <= primaryQueryRadiusKm() * 0.9) {
       // Traffic is back in the primary circle: resume the full /v2/point scan
       // so emergency squawks on non-nearest aircraft are seen again.
       LOG_INFO("Aircraft within %d km again; resuming full scan", (int)SEARCH_RADIUS_KM);
@@ -1465,7 +1491,11 @@ static FetchResult fetchNearestFlight(FlightInfo &out) {
     LOG_INFO("Nothing within %d km, widening to %d km",
              (int)SEARCH_RADIUS_KM, (int)SEARCH_RADIUS_FALLBACK_KM);
     esp_task_wdt_reset();  // two fetches must never share one un-fed span
-    fr = fetchClosestAt(SEARCH_RADIUS_FALLBACK_KM, out);
+    // /v2/point, not /v2/closest. The single aircraft /v2/closest returns may
+    // fail the position-freshness gate, and rejecting it declared the entire
+    // 100 km ring empty — showing "No aircraft nearby" over a busy sky. With
+    // the full list there are alternatives to fall back to.
+    fr = fetchClosestAt(SEARCH_RADIUS_FALLBACK_KM, out, /*allAircraft=*/true);
     if (fr == FETCH_OK) g_wideMode = true;
   }
   return fr;

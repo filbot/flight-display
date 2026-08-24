@@ -6,6 +6,49 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-24 15:05 UTC: "No aircraft nearby" investigated — the display was wrong
+
+Filip saw the splash briefly. Health data pins it to **15:05:30 -> 15:06:34**
+(~64s, 2 fetch cycles) with `fetch_empty` going 3 -> 4, so it was a genuine
+empty result rather than a network failure. But "empty" there meant the **100 km**
+search found nothing acceptable, and a 100 km circle around Seattle at 8am is
+never empty. The logs hold **278 cycles** where both searches came back empty.
+
+### Two bugs found
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 20 | **high** | The widened search used `/v2/closest`, which returns **exactly one** aircraft. If that single aircraft failed the position-freshness gate it was rejected and the entire 100 km ring was declared empty, with no alternative to fall back to — showing "No aircraft nearby" over a busy sky. Both searches now use `/v2/point`, which also restores emergency scanning in the widened ring. | **fixed 2026-08-24** |
+| 21 | medium | **Self-inflicted, same morning.** Sticky wide mode compared against `SEARCH_RADIUS_KM` (10 km), but the API takes integer nautical miles so 10 km is sent as 5 nm = **9.26 km**. An aircraft in the 9.26-10 km band was invisible to the primary search yet passed the exit test, so wide mode toggled every cycle and paid for two searches — exactly what the optimization was meant to stop. Now compared against `primaryQueryRadiusKm()` with 10% hysteresis. Confirmed live against an aircraft at 9.95 km. | **fixed 2026-08-24** |
+
+### Instrumentation gap closed
+
+`No valid aircraft found in response` was logged identically whether the API sent
+zero aircraft or sent some that we rejected, making the two indistinguishable
+afterwards. It now reads `No displayable aircraft: N returned, M rejected on
+position/staleness`, and `/healthz` exposes `last_ac_returned` / `last_ac_rejected`.
+Already useful: live samples read `0 returned, 0 rejected`, confirming that a
+quiet primary circle really is empty rather than being discarded by our gate.
+
+### #17 miss rate corrected
+
+A clean 2-minute measurement on live data gives **29 ok / 1 miss / 0 skip** — a
+97% hit rate. The overnight "70% miss" was dominated by the extractor bug, not by
+coverage. Test-suite runs contaminate these counters badly (mock hexes are never
+in the receiver), so only measure them against the live API.
+
+### Not a fault: power loss
+
+The device vanished from both USB and Wi-Fi mid-regression. The CP2102 and the
+entire monitor-hub tree disappeared from the USB bus together, so the dock lost
+power — the board came back with `reset_reason POWERON`. Worth remembering that
+a total disappearance of both transports at once points at power, not firmware.
+
+Verified after: flows 13/13, faults 10/10, display harness 24/24.
+
+---
+
+
 ## 2026-08-24 morning: the four optimizations, applied
 
 ### #16 watchdog exposure — fixed
