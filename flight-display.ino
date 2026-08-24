@@ -22,6 +22,7 @@
 
 #include "config.h"  // Create from config.example.h and do not commit secrets
 #include "aircraft_types.h"
+#include "local_rx.h"
 #include "log.h"
 
 // Sentinel for alt_baro == "ground" (aircraft on the surface)
@@ -417,6 +418,19 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 #define LOCAL_RX_BACKOFF_MS 60000
 #endif
 // A local record older than this is not "live" and is ignored.
+// Backstop only. The overnight 70% miss rate that motivated this gate was
+// largely a bug in the record extractor, not lack of coverage — with that fixed
+// the receiver hits 100% on aircraft it can hear. So keep the gate generous and
+// let the miss counter below do the fine-grained work; an aircraft at 50 km+ is
+// genuinely unlikely to be heard and is not worth three probes to confirm.
+#ifndef LOCAL_RX_MAX_DIST_KM
+#define LOCAL_RX_MAX_DIST_KM 50
+#endif
+// Give up on an aircraft the receiver plainly cannot hear.
+#ifndef LOCAL_RX_MISS_GIVEUP
+#define LOCAL_RX_MISS_GIVEUP 3
+#endif
+
 #ifndef LOCAL_RX_MAX_AGE_S
 #define LOCAL_RX_MAX_AGE_S 15
 #endif
@@ -448,7 +462,10 @@ static uint32_t g_localMsLast = 0, g_localMsMax = 0;
 #if FEATURE_LOCAL_RX
 static uint32_t g_nextLocalAt = 0;
 static uint32_t g_statLocalOk = 0, g_statLocalMiss = 0, g_statLocalFail = 0;
+static uint32_t g_statLocalSkip = 0;
 static float g_localSeenPos = -1.0f;
+static char g_localMissHex[8] = "";
+static uint8_t g_localMissRun = 0;
 #endif
 static char g_splashTop[40] = "";
 static char g_splashBottom[40] = "";
@@ -498,6 +515,7 @@ static void httpHandleHealth() {
   d["local_ok"] = g_statLocalOk;
   d["local_miss"] = g_statLocalMiss;
   d["local_fail"] = g_statLocalFail;
+  d["local_skip"] = g_statLocalSkip;
   d["local_seen_pos"] = g_localSeenPos;
 #endif
   d["wifi_drop_active"] = (g_wifiDropUntil != 0);
@@ -1132,6 +1150,39 @@ static FlightInfo selectAircraft(JsonVariant root) {
   return best;
 }
 
+// Resolve the API host BEFORE the HTTP call, and feed the watchdog in between.
+//
+// DNS runs inside http.begin() and can take ~15s (finding #14) on top of an 8s
+// connect and an 8s read, so one fetch could occupy ~31s of a single loop()
+// iteration — past the 25s watchdog. Two production resets came from exactly
+// that sum. Doing the lookup separately turns one ~31s un-fed span into two
+// spans of at most ~16s, and gives a fast exit when DNS is simply down.
+// The result lands in the lwIP cache, so http.begin()'s own lookup is instant.
+static bool resolveApiHost(const char* base) {
+  const char* p = strstr(base, "://");
+  if (!p) return true;
+  p += 3;
+  char host[64];
+  size_t n = 0;
+  while (p[n] && p[n] != '/' && p[n] != ':' && n < sizeof(host) - 1) { host[n] = p[n]; ++n; }
+  host[n] = '\0';
+  if (!host[0]) return true;
+
+  IPAddress ip;
+  if (ip.fromString(host)) return true;  // already an address; nothing to resolve
+
+  uint32_t t0 = millis();
+  bool ok = (WiFi.hostByName(host, ip) == 1);
+  uint32_t took = millis() - t0;
+  esp_task_wdt_reset();  // the lookup is its own span; start the fetch fresh
+  if (!ok) {
+    LOG_WARN("DNS lookup for %s failed after %lu ms", host, (unsigned long)took);
+    return false;
+  }
+  if (took > 1000) LOG_WARN("DNS for %s took %lu ms", host, (unsigned long)took);
+  return true;
+}
+
 static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAircraft = false) {
   if (WiFi.status() != WL_CONNECTED) return FETCH_FAIL;
 
@@ -1151,6 +1202,8 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
   LOG_INFO("HTTP GET %s", url);
   LOG_DEBUG("WiFi RSSI: %d dBm", WiFi.RSSI());
   LOG_DEBUG("Free heap: %u", (unsigned)ESP.getFreeHeap());
+
+  if (!resolveApiHost(g_apiBase)) return FETCH_FAIL;
 
   HTTPClient http;
   http.setReuse(false);
@@ -1263,9 +1316,28 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
 //
 // Deliberately conservative: it never changes what is displayed, only how
 // current the numbers are, and it never counts as an API fetch failure.
+// Pull one aircraft's record out of the receiver's JSON without parsing all of
+// it. The body is 7-16 KB and ArduinoJson must tokenise every byte to find one
+// record, which measured p50 120ms / p95 310ms on device against 27ms of actual
+// network time. Searching for the hex and parsing only the matching record cuts
+// that to the cost of a few memcmps.
+//
+// Safe because dump1090 records are flat — arrays like "mlat":[] appear, but no
+// nested objects — so the first '}' after the needle ends the record.
 static void refreshFromLocalReceiver() {
   if (!g_haveDisplayed || !g_lastShown.hex[0]) return;
   if (WiFi.status() != WL_CONNECTED) return;
+
+  // Skip aircraft the receiver realistically cannot hear, rather than paying a
+  // fetch to rediscover that. Overnight this was 70% of all lookups.
+  if (!isnan(g_lastShown.distanceKm) && g_lastShown.distanceKm > LOCAL_RX_MAX_DIST_KM) {
+    g_statLocalSkip++;
+    return;
+  }
+  if (strcasecmp(g_localMissHex, g_lastShown.hex) == 0 && g_localMissRun >= LOCAL_RX_MISS_GIVEUP) {
+    g_statLocalSkip++;
+    return;
+  }
   uint32_t localStart = millis();
 
   WiFiClient client;  // plain HTTP on the LAN: no TLS, and an IP so no DNS
@@ -1290,73 +1362,111 @@ static void refreshFromLocalReceiver() {
     return;
   }
 
-  StaticJsonDocument<192> filter;
-  JsonObject f = filter.createNestedArray("aircraft").createNestedObject();
-  f["hex"] = true;
-  f["lat"] = true;
-  f["lon"] = true;
-  f["alt_baro"] = true;
-  f["alt_geom"] = true;
-  f["seen_pos"] = true;
+  char hexLower[8];
+  strncpy(hexLower, g_lastShown.hex, sizeof(hexLower) - 1);
+  hexLower[sizeof(hexLower) - 1] = '\0';
+  for (char *c = hexLower; *c; ++c) *c = tolower(*c);
 
-  StaticJsonDocument<2048> doc;
+  // 768 not 384: real records reach ~525 bytes here and grow with nav/wind
+  // fields. An undersized buffer silently reported "not found".
+  char record[768];
+  bool truncated = false;
   PatientStream body(client, LOCAL_RX_READ_TIMEOUT_MS);
-  DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  bool found = extractLocalRecord(body, hexLower, record, sizeof(record), &truncated);
   http.end();
-  if (err) {
-    g_statLocalFail++;
-    LOG_WARN("Local receiver parse error: %s", err.c_str());
-    g_nextLocalAt = millis() + LOCAL_RX_BACKOFF_MS;
-    return;
-  }
-
   g_localMsLast = millis() - localStart;
   if (g_localMsLast > g_localMsMax) g_localMsMax = g_localMsLast;
 
-  for (JsonObject a : doc["aircraft"].as<JsonArray>()) {
-    const char* hx = a["hex"].isNull() ? nullptr : a["hex"].as<const char*>();
-    if (!hx || strcasecmp(hx, g_lastShown.hex) != 0) continue;
-
-    // Only trust a position the receiver heard recently.
-    if (a["seen_pos"].isNull()) { g_statLocalMiss++; return; }
-    float age = a["seen_pos"].as<float>();
-    if (age > LOCAL_RX_MAX_AGE_S) { g_statLocalMiss++; return; }
-    if (a["lat"].isNull() || a["lon"].isNull()) { g_statLocalMiss++; return; }
-
-    FlightInfo upd = g_lastShown;  // identity and classification untouched
-    upd.lat = a["lat"].as<double>();
-    upd.lon = a["lon"].as<double>();
-    upd.distanceKm = haversineKm(HOME_LAT, HOME_LON, upd.lat, upd.lon);
-    if (!a["alt_baro"].isNull()) {
-      upd.altitudeFt = a["alt_baro"].is<const char*>()
-          ? (strcasecmp(a["alt_baro"].as<const char*>(), "ground") == 0 ? ALT_GROUND : ALT_UNKNOWN)
-          : decodeAltitude(a["alt_baro"]);
-    } else if (!a["alt_geom"].isNull()) {
-      upd.altitudeFt = decodeAltitude(a["alt_geom"]);
-    }
-    g_localSeenPos = age;
-    g_statLocalOk++;
-    // sameFlightDisplay() already ignores sub-0.1km jitter, so this only
-    // redraws when a cell would actually read differently.
-    if (!sameFlightDisplay(upd, g_lastShown)) {
-      g_lastShown = upd;
-      renderFlight(g_lastShown);
+  if (truncated) {
+    g_statLocalFail++;
+    LOG_WARN("Local record for %s exceeded %u bytes", hexLower, (unsigned)sizeof(record));
+    return;
+  }
+  if (!found) {
+    g_statLocalMiss++;
+    if (strcasecmp(g_localMissHex, g_lastShown.hex) != 0) {
+      strncpy(g_localMissHex, g_lastShown.hex, sizeof(g_localMissHex) - 1);
+      g_localMissHex[sizeof(g_localMissHex) - 1] = '\0';
+      g_localMissRun = 1;
+    } else if (g_localMissRun < 255) {
+      g_localMissRun++;
     }
     return;
   }
-  g_statLocalMiss++;  // heard by the API but not by us
+
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, record)) {
+    g_statLocalFail++;
+    LOG_WARN("Local record parse error");
+    return;
+  }
+  JsonObject a = doc.as<JsonObject>();
+
+  // Only trust a position the receiver heard recently.
+  if (a["seen_pos"].isNull() || a["lat"].isNull() || a["lon"].isNull()) { g_statLocalMiss++; return; }
+  float age = a["seen_pos"].as<float>();
+  if (age > LOCAL_RX_MAX_AGE_S) { g_statLocalMiss++; return; }
+
+  FlightInfo upd = g_lastShown;  // identity and classification untouched
+  upd.lat = a["lat"].as<double>();
+  upd.lon = a["lon"].as<double>();
+  upd.distanceKm = haversineKm(HOME_LAT, HOME_LON, upd.lat, upd.lon);
+  if (!a["alt_baro"].isNull()) {
+    upd.altitudeFt = a["alt_baro"].is<const char*>()
+        ? (strcasecmp(a["alt_baro"].as<const char*>(), "ground") == 0 ? ALT_GROUND : ALT_UNKNOWN)
+        : decodeAltitude(a["alt_baro"]);
+  } else if (!a["alt_geom"].isNull()) {
+    upd.altitudeFt = decodeAltitude(a["alt_geom"]);
+  }
+  g_localSeenPos = age;
+  g_statLocalOk++;
+  g_localMissRun = 0;
+  // sameFlightDisplay() already ignores sub-0.1km jitter, so this only redraws
+  // when a cell would actually read differently.
+  if (!sameFlightDisplay(upd, g_lastShown)) {
+    g_lastShown = upd;
+    renderFlight(g_lastShown);
+  }
 }
 #endif  // FEATURE_LOCAL_RX
 
 // Primary radius first; widen only when the nearby sky is empty, so the
 // display always has an aircraft when anything is in range while keeping
 // the common case at one API call per cycle.
+// Sticky wide mode. Overnight the nearby sky is empty for hours, and the old
+// logic paid TWO API calls every cycle to rediscover that — 522 widenings in a
+// 7.6h window, doubling both the API load and the per-iteration blocking that
+// tripped the watchdog. Once the widened search is what is working, keep using
+// it alone, and drop back automatically as soon as it finds something close.
+static bool g_wideMode = false;
+
 static FetchResult fetchNearestFlight(FlightInfo &out) {
+  if (g_wideMode) {
+    // /v2/point, not /v2/closest: a single-aircraft response would silently
+    // switch OFF emergency-squawk scanning for however many hours the sky stays
+    // quiet, which is precisely when nobody would notice it had stopped.
+    // Affordable because wide mode only engages when the sky IS quiet, so the
+    // ring is small then — measured 9.7 KB / 20 aircraft, against 44 KB / 95 at
+    // midday when the primary circle is busy and wide mode never runs.
+    FetchResult fr = fetchClosestAt(SEARCH_RADIUS_FALLBACK_KM, out, /*allAircraft=*/true);
+    if (fr == FETCH_OK && out.distanceKm <= SEARCH_RADIUS_KM) {
+      // Traffic is back in the primary circle: resume the full /v2/point scan
+      // so emergency squawks on non-nearest aircraft are seen again.
+      LOG_INFO("Aircraft within %d km again; resuming full scan", (int)SEARCH_RADIUS_KM);
+      g_wideMode = false;
+    } else if (fr != FETCH_OK) {
+      g_wideMode = false;  // nothing out there either — probe normally next time
+    }
+    return fr;
+  }
+
   FetchResult fr = fetchClosestAt(SEARCH_RADIUS_KM, out, /*allAircraft=*/true);
   if (fr == FETCH_EMPTY && SEARCH_RADIUS_FALLBACK_KM > SEARCH_RADIUS_KM) {
     LOG_INFO("Nothing within %d km, widening to %d km",
              (int)SEARCH_RADIUS_KM, (int)SEARCH_RADIUS_FALLBACK_KM);
+    esp_task_wdt_reset();  // two fetches must never share one un-fed span
     fr = fetchClosestAt(SEARCH_RADIUS_FALLBACK_KM, out);
+    if (fr == FETCH_OK) g_wideMode = true;
   }
   return fr;
 }

@@ -153,8 +153,11 @@ def t_no_widen_when_found(mock):
     wait_fetches(c["fetch_ok"] + c["fetch_empty"] + c["fetch_fail"], 1)
     got = search_reqs(reqs_since(mark))
     radii = [radius_of(r) for r in got]
-    # bool(radii) matters: an empty list would otherwise pass this vacuously
-    ok = bool(radii) and EXPECT_FALLBACK_NM not in radii
+    # The assertion is ONE call per cycle, not which radius. Under sticky wide
+    # mode the device may legitimately still be on the wide radius and drop back
+    # to the primary only once it sees an aircraft close enough — what must
+    # never happen is paying for two searches in one cycle.
+    ok = len(radii) == 1
     check("no_widen_when_found", ok, f"radii requested {radii[:4]}",
           "a populated primary circle must cost exactly one API call")
 

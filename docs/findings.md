@@ -6,6 +6,85 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-24 morning: the four optimizations, applied
+
+### #16 watchdog exposure — fixed
+
+`resolveApiHost()` resolves the API host with `WiFi.hostByName()` *before* the
+HTTP call and feeds the watchdog in between. DNS previously ran inside
+`http.begin()` on top of connect and read, so one fetch could hold a single
+`loop()` iteration for ~31s against a 25s watchdog — the cause of both
+production resets. The lookup and the fetch are now two spans of at most ~16s,
+the lwIP cache makes `http.begin()`'s own lookup instant, and a DNS failure now
+exits fast instead of proceeding. `esp_task_wdt_reset()` also runs between the
+primary and widened fetches so they can never share one un-fed span.
+
+### #2 double fetch per cycle — fixed, with a caught regression
+
+Sticky wide mode: once the widened search is what is working, it is used alone
+(one call, not two) and drops back automatically as soon as it finds an aircraft
+inside the primary circle. 522 widenings in 7.6h becomes roughly one call per
+cycle.
+
+**A regression this introduced, caught by the test suite:** the widened search
+originally used `/v2/closest`, which returns a single aircraft — silently
+switching OFF emergency-squawk scanning for however many hours the sky stayed
+quiet, which is exactly when nobody would notice. `emergency_preempts` failed
+and exposed it. Wide mode now uses `/v2/point` too. Affordable because wide mode
+only engages when the sky *is* quiet: measured **9.7 KB / 20 aircraft** in the
+wide ring at that hour, against 44 KB / 95 at midday when the primary circle is
+busy and wide mode never runs.
+
+`no_widen_when_found` also had to be corrected: it asserted "not the fallback
+radius", which sticky wide mode legitimately violates. The real invariant is
+**exactly one search per cycle**, and that is what it now checks.
+
+### #18 local parse cost — fixed, after shipping two bugs
+
+Replaced the whole-body JSON parse with a targeted record extractor. Measured on
+device: **~44 ms typical, 26-137 ms range**, against p50 120 / p95 310 / max
+1572 ms before.
+
+Two bugs shipped on the way, both of which looked identical to "the aircraft is
+not being heard", and neither of which a device test could distinguish:
+
+1. The needle was a fixed `"hex":"..."`, but this receiver emits
+   `"hex": "a24ba7"` **with a space** (Python `json.dumps`). It never matched
+   once — 0 hits across every attempt.
+2. The capture buffer was 384 bytes while real records run to **523 bytes**;
+   11 of 16 records did not fit, and overrunning returned "not found".
+
+Both were found only by lifting the parser into `local_rx.h` and testing it on
+the host against a real captured payload (`tools/hosttest/test_local_rx.cpp`,
+16/16 records at chunk sizes 64/128/512/4096). `extractLocalRecord()` now
+reports truncation separately from a miss, so an undersized buffer can never
+again masquerade as an absent aircraft.
+
+### #17 local miss rate — partly a measurement artifact
+
+The 70% miss rate was measured with the extractor described above, so it
+conflated genuine non-coverage with bug (1). With the extractor fixed the device
+now hits **33/33 with 0 misses**. The distance gate was therefore widened from
+15 km to a 50 km backstop, leaving the 3-strike per-hex miss counter to do the
+fine-grained work. The true coverage figure needs re-measuring overnight.
+
+### Data source note
+
+The `:8080/aircraft` endpoint is Filip's own LCD helper service, not stock
+PiAware. Per <https://filbot.com/piaware-data-display/> the authoritative file is
+`/run/dump1090-fa/aircraft.json`; the service re-serves it via Python, which is
+where the `"hex": "..."` spacing comes from. It appears faithful — full dump1090
+field set, and 100% hit rate once the extractor was fixed — so the earlier zero
+hits were entirely our bug, not the service. Port 80 is closed on the Pi, so the
+stock SkyAware path is not reachable; switching to it later is a `LOCAL_RX_PORT`
+and `LOCAL_RX_PATH` change only.
+
+Verified: flows 13/13, faults 10/10, display harness 24/24, host type-table
+tests green, host local-rx tests 16/16.
+
+---
+
+
 ## 2026-08-24 05:20-12:56 UTC: first clean observational baseline (7.6h)
 
 No synthetic fault injection, no mock, no test override — verified: `overnight.log`
@@ -18,9 +97,9 @@ has no entries in the window, zero mock requests, and all 845 samples used
 
 | # | Severity | Finding | Status |
 |---|---|---|---|
-| 16 | **high** | **The task watchdog fired twice in production** (08:51:34, 09:39:53), both times with `loopTask (CPU 1)` blocked inside an `HTTP GET` and both CPUs idle — waiting on network I/O, not spinning. Worst *surviving* iteration was **22,217 ms** against the 25,000 ms watchdog. My earlier margin estimate in finding #11 was **wrong**: it assumed ~16s worst case, but DNS (up to 15s, finding #14) happens *inside* `http.begin()` on top of connect (8s) and read (8s), and the tiered fallback can issue **two** fetches in a single `loop()` iteration. Worst case is therefore ~31s for one fetch and roughly double that for a widened search — comfortably past the watchdog. | open |
-| 17 | medium | **The local-receiver refresh misses 70% of the time** (893 ok vs 2,087 miss, 0 fail). Cause: overnight the nearby sky is empty, so 61% of displayed aircraft came from the 100 km fallback (median distance 14.1 km, max 23.9 km) and are not heard locally with a fresh position. Each miss still costs a full fetch and 16 KB parse. | open |
-| 18 | medium | **The local fetch costs p50 120 ms / p95 310 ms / max 1572 ms** on device against 27 ms measured with curl. The gap is the 16 KB JSON parse on a 240 MHz MCU, not the network. At a 4 s interval that is ~3% of wall clock spent parsing to extract one aircraft's position. | open |
+| 16 | **high** | **The task watchdog fired twice in production** (08:51:34, 09:39:53), both times with `loopTask (CPU 1)` blocked inside an `HTTP GET` and both CPUs idle — waiting on network I/O, not spinning. Worst *surviving* iteration was **22,217 ms** against the 25,000 ms watchdog. My earlier margin estimate in finding #11 was **wrong**: it assumed ~16s worst case, but DNS (up to 15s, finding #14) happens *inside* `http.begin()` on top of connect (8s) and read (8s), and the tiered fallback can issue **two** fetches in a single `loop()` iteration. Worst case is therefore ~31s for one fetch and roughly double that for a widened search — comfortably past the watchdog. | **fixed 2026-08-24** |
+| 17 | medium | **The local-receiver refresh misses 70% of the time** (893 ok vs 2,087 miss, 0 fail). Cause: overnight the nearby sky is empty, so 61% of displayed aircraft came from the 100 km fallback (median distance 14.1 km, max 23.9 km) and are not heard locally with a fresh position. Each miss still costs a full fetch and 16 KB parse. | **fixed 2026-08-24** (partly a measurement artifact) |
+| 18 | medium | **The local fetch costs p50 120 ms / p95 310 ms / max 1572 ms** on device against 27 ms measured with curl. The gap is the 16 KB JSON parse on a 240 MHz MCU, not the network. At a 4 s interval that is ~3% of wall clock spent parsing to extract one aircraft's position. | **fixed 2026-08-24** |
 | 19 | low | `nightreport.py`'s "Suite results" section ignored `--since` and read the whole `overnight.log`, so a night with **no** test runs reported 15 passes from previous days — making a clean baseline look contaminated. | **fixed 2026-08-24** |
 
 ### Reliability, measured

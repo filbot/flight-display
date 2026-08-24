@@ -23,3 +23,20 @@ struct String {
   bool operator==(const char* rhs) const { return s == (rhs ? rhs : ""); }
 };
 inline String operator+(const char* lhs, const String& rhs) { String r; r.s = std::string(lhs ? lhs : "") + rhs.s; return r; }
+
+// --- host-test shims for stream/timing used by local_rx.h ---
+#include <chrono>
+inline unsigned long millis() {
+  static auto t0 = std::chrono::steady_clock::now();
+  return (unsigned long)std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+}
+class Stream {
+ public:
+  virtual int available() = 0;
+  virtual int read() = 0;
+  virtual int peek() = 0;
+  virtual size_t write(uint8_t) = 0;
+  virtual size_t readBytes(char *buffer, size_t length) = 0;
+  virtual ~Stream() {}
+};
