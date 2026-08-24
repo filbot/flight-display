@@ -6,6 +6,56 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-24: local ADS-B receiver feeds the live numbers
+
+Filip runs PiAware on the roof. It serves dump1090 `aircraft.json` at
+`http://192.168.1.243:8080/aircraft` — a `FlightAwareLCDHTTP` service, not the
+usual SkyAware path (`/skyaware/data/aircraft.json` and `:8080/data/...` both
+404, which is why it took a port scan to find). 45 aircraft, 16 KB, **27 ms**.
+
+Two proposed indicators were measured and rejected before writing any firmware:
+
+- **"Is my receiver hearing this aircraft?"** — overlap is **100% (15/15)**
+  across five samples. A rooftop antenna hears everything adsb.lol reports
+  within 10 km, so the indicator would be lit permanently.
+- **Reception freshness** — local `seen` is 0.0-0.2s (median 0.1) against
+  adsb.lol's 0.0-0.457s (median 0.275). Local is fresher in 11 of 14 samples,
+  by about **0.2 seconds**. Invisible on a display that updates every 30s.
+
+The same sampling exposed the thing actually worth fixing: **the display was up
+to 30 seconds stale.** Over 137 seconds the nearest aircraft changed twice and
+one aircraft's distance swung 2.90 -> 4.24 nm, all invisible between API polls.
+
+So the receiver now refreshes distance and altitude every 4s
+(`FEATURE_LOCAL_RX`). adsb.lol still owns identity, type, classification and
+which aircraft to show — the local feed carries no `t`, `desc`, `r` or
+`dbFlags`, so it cannot replace the API, only sharpen it.
+
+Measured on device: one aircraft tracked 6.08 -> 3.62 mi over 85s with altitude
+stepping 2025 -> 1875 ft, updating on nearly every 5s sample. 46 local fetches,
+**0 misses, 0 failures**, `seen_pos` 0.1-1.8s. Heap unchanged.
+
+Design notes worth keeping:
+
+- **IP, never a hostname** — a failed DNS lookup costs a fixed 15s of blocked
+  `loop()` (finding #14). There is no reason to risk that for a LAN device.
+- Plain HTTP, short timeouts (2s connect / 3s read), and a 60s backoff after any
+  failure so a switched-off receiver cannot stall `loop()` every 4s.
+- A local failure is **never** counted as an API fetch failure — the same
+  distinction the Wi-Fi fix drew between "we did not try" and "we tried and
+  failed".
+- `PatientStream` was widened from `WiFiClientSecure&` to `Client&` so the same
+  gap-tolerant reader serves both the TLS API fetch and this plain-HTTP one.
+- Re-render is gated by `sameFlightDisplay()`, which already ignores sub-0.1 km
+  jitter, so a redraw only happens when a cell would actually read differently.
+
+Verified: flows 13/13, faults 10/10, display harness 24/24. Mock hexes were
+checked against the live receiver for collisions (none), so the suites cannot be
+perturbed by the local refresh.
+
+---
+
+
 ## 2026-08-23 late: cleared the low-severity backlog
 
 Seven findings closed. Each was measured as unreachable through `/v2/closest`,

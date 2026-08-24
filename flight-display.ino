@@ -391,6 +391,42 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 // -----------------------------
 // Test HTTP server (/test/closest)
 // -----------------------------
+// Local ADS-B receiver (PiAware / dump1090). Optional, per-installation: set
+// FEATURE_LOCAL_RX and LOCAL_RX_HOST in config.h. Use an IP ADDRESS, not a
+// hostname — a failed DNS lookup costs a fixed 15s of blocked loop() (see
+// finding #14), and there is no reason to risk that for a LAN device.
+#ifndef FEATURE_LOCAL_RX
+#define FEATURE_LOCAL_RX 0
+#endif
+#ifndef LOCAL_RX_HOST
+#define LOCAL_RX_HOST "192.168.1.243"
+#endif
+#ifndef LOCAL_RX_PORT
+#define LOCAL_RX_PORT 8080
+#endif
+#ifndef LOCAL_RX_PATH
+#define LOCAL_RX_PATH "/aircraft"
+#endif
+// How often to refresh the live numbers. The API poll is 30s; this is what
+// closes the gap, so it wants to be small — the fetch costs ~30ms on the LAN.
+#ifndef LOCAL_RX_INTERVAL_MS
+#define LOCAL_RX_INTERVAL_MS 4000
+#endif
+// After a failure, stop hammering a receiver that is switched off.
+#ifndef LOCAL_RX_BACKOFF_MS
+#define LOCAL_RX_BACKOFF_MS 60000
+#endif
+// A local record older than this is not "live" and is ignored.
+#ifndef LOCAL_RX_MAX_AGE_S
+#define LOCAL_RX_MAX_AGE_S 15
+#endif
+#ifndef LOCAL_RX_CONNECT_TIMEOUT_MS
+#define LOCAL_RX_CONNECT_TIMEOUT_MS 2000
+#endif
+#ifndef LOCAL_RX_READ_TIMEOUT_MS
+#define LOCAL_RX_READ_TIMEOUT_MS 3000
+#endif
+
 #ifndef FEATURE_TEST_ENDPOINT
 #define FEATURE_TEST_ENDPOINT 1  // Set 0 to remove test HTTP endpoint
 #endif
@@ -399,6 +435,11 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 #endif
 
 // Declared ahead of the HTTP handlers so /healthz can report what's on screen
+#if FEATURE_LOCAL_RX
+static uint32_t g_nextLocalAt = 0;
+static uint32_t g_statLocalOk = 0, g_statLocalMiss = 0, g_statLocalFail = 0;
+static float g_localSeenPos = -1.0f;
+#endif
 static char g_splashTop[40] = "";
 static char g_splashBottom[40] = "";
 static bool g_splashActive = false;
@@ -443,6 +484,12 @@ static void httpHandleHealth() {
   d["showing_flight"] = g_haveDisplayed;
   d["display_dim"] = g_displayDim;
   d["splash_active"] = g_splashActive;
+#if FEATURE_LOCAL_RX
+  d["local_ok"] = g_statLocalOk;
+  d["local_miss"] = g_statLocalMiss;
+  d["local_fail"] = g_statLocalFail;
+  d["local_seen_pos"] = g_localSeenPos;
+#endif
   d["wifi_drop_active"] = (g_wifiDropUntil != 0);
   d["splash_draws"] = g_statSplashDraws;
   d["shift_idx"] = pixelShiftIdx();
@@ -980,10 +1027,11 @@ static FlightInfo parseAircraft(JsonObject obj) {
 //
 // Only readBytes() needs overriding: ArduinoJson reads exclusively through it.
 // Safe because these responses carry Content-Length (never chunked encoding),
-// so reading the client directly needs no de-chunking.
+// so reading the client directly needs no de-chunking. Takes Client& so it
+// serves both the TLS API fetch and the plain-HTTP local receiver fetch.
 class PatientStream : public Stream {
  public:
-  PatientStream(WiFiClientSecure &c, uint32_t budgetMs)
+  PatientStream(Client &c, uint32_t budgetMs)
       : c_(c), deadline_(millis() + budgetMs) {}
 
   int available() override { return c_.available(); }
@@ -1018,7 +1066,7 @@ class PatientStream : public Stream {
     return true;
   }
 
-  WiFiClientSecure &c_;
+  Client &c_;
   uint32_t deadline_;
   bool timedOut_ = false;
 };
@@ -1177,6 +1225,100 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
   LOG_INFO("No valid aircraft found in response");
   return FETCH_EMPTY;
 }
+
+#if FEATURE_LOCAL_RX
+// Refresh the two live numbers — distance and altitude — for the aircraft that
+// is already on screen, from the local ADS-B receiver.
+//
+// adsb.lol still owns identity, type, classification and which aircraft to
+// show. This only closes the staleness gap: the API is polled every 30s, so
+// without this the distance ticks in half-mile jumps and can lag reality by a
+// full interval (measured: one aircraft moved 2.90 -> 4.24 nm inside 95s).
+// The receiver answers in ~30ms on the LAN with no rate limit, so it can be
+// asked every few seconds for free.
+//
+// Deliberately conservative: it never changes what is displayed, only how
+// current the numbers are, and it never counts as an API fetch failure.
+static void refreshFromLocalReceiver() {
+  if (!g_haveDisplayed || !g_lastShown.hex[0]) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  WiFiClient client;  // plain HTTP on the LAN: no TLS, and an IP so no DNS
+  HTTPClient http;
+  http.setReuse(false);
+  http.setConnectTimeout(LOCAL_RX_CONNECT_TIMEOUT_MS);
+  http.setTimeout(LOCAL_RX_READ_TIMEOUT_MS);
+
+  char url[96];
+  snprintf(url, sizeof(url), "http://%s:%d%s", LOCAL_RX_HOST, (int)LOCAL_RX_PORT, LOCAL_RX_PATH);
+  if (!http.begin(client, url)) {
+    g_statLocalFail++;
+    g_nextLocalAt = millis() + LOCAL_RX_BACKOFF_MS;
+    return;
+  }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    g_statLocalFail++;
+    LOG_WARN("Local receiver HTTP %d; backing off", code);
+    g_nextLocalAt = millis() + LOCAL_RX_BACKOFF_MS;
+    return;
+  }
+
+  StaticJsonDocument<192> filter;
+  JsonObject f = filter.createNestedArray("aircraft").createNestedObject();
+  f["hex"] = true;
+  f["lat"] = true;
+  f["lon"] = true;
+  f["alt_baro"] = true;
+  f["alt_geom"] = true;
+  f["seen_pos"] = true;
+
+  StaticJsonDocument<2048> doc;
+  PatientStream body(client, LOCAL_RX_READ_TIMEOUT_MS);
+  DeserializationError err = deserializeJson(doc, body, DeserializationOption::Filter(filter));
+  http.end();
+  if (err) {
+    g_statLocalFail++;
+    LOG_WARN("Local receiver parse error: %s", err.c_str());
+    g_nextLocalAt = millis() + LOCAL_RX_BACKOFF_MS;
+    return;
+  }
+
+  for (JsonObject a : doc["aircraft"].as<JsonArray>()) {
+    const char* hx = a["hex"].isNull() ? nullptr : a["hex"].as<const char*>();
+    if (!hx || strcasecmp(hx, g_lastShown.hex) != 0) continue;
+
+    // Only trust a position the receiver heard recently.
+    if (a["seen_pos"].isNull()) { g_statLocalMiss++; return; }
+    float age = a["seen_pos"].as<float>();
+    if (age > LOCAL_RX_MAX_AGE_S) { g_statLocalMiss++; return; }
+    if (a["lat"].isNull() || a["lon"].isNull()) { g_statLocalMiss++; return; }
+
+    FlightInfo upd = g_lastShown;  // identity and classification untouched
+    upd.lat = a["lat"].as<double>();
+    upd.lon = a["lon"].as<double>();
+    upd.distanceKm = haversineKm(HOME_LAT, HOME_LON, upd.lat, upd.lon);
+    if (!a["alt_baro"].isNull()) {
+      upd.altitudeFt = a["alt_baro"].is<const char*>()
+          ? (strcasecmp(a["alt_baro"].as<const char*>(), "ground") == 0 ? ALT_GROUND : ALT_UNKNOWN)
+          : decodeAltitude(a["alt_baro"]);
+    } else if (!a["alt_geom"].isNull()) {
+      upd.altitudeFt = decodeAltitude(a["alt_geom"]);
+    }
+    g_localSeenPos = age;
+    g_statLocalOk++;
+    // sameFlightDisplay() already ignores sub-0.1km jitter, so this only
+    // redraws when a cell would actually read differently.
+    if (!sameFlightDisplay(upd, g_lastShown)) {
+      g_lastShown = upd;
+      renderFlight(g_lastShown);
+    }
+    return;
+  }
+  g_statLocalMiss++;  // heard by the API but not by us
+}
+#endif  // FEATURE_LOCAL_RX
 
 // Primary radius first; widen only when the nearby sky is empty, so the
 // display always has an aircraft when anything is in range while keeping
@@ -1571,6 +1713,14 @@ void loop() {
     // Skip network fetch while override active
     yield();
     return;
+  }
+#endif
+
+#if FEATURE_LOCAL_RX
+  // Keep the live numbers current between API polls.
+  if ((int32_t)(millis() - g_nextLocalAt) >= 0) {
+    g_nextLocalAt = millis() + LOCAL_RX_INTERVAL_MS;
+    refreshFromLocalReceiver();
   }
 #endif
 

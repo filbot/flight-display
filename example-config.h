@@ -58,3 +58,14 @@
 // Display brightness (SSD1322 contrast register, 0-255). Default is 153 (60%)
 // to extend panel life on a 24/7 display; splashes run at a quarter of this.
 // #define DISPLAY_CONTRAST 153
+
+// --- Local ADS-B receiver (optional) ---
+// If you run PiAware / dump1090 / readsb, the device can refresh distance and
+// altitude from it every few seconds between the 30s API polls, so the numbers
+// move smoothly instead of ticking. Identity and type still come from the API.
+// Use an IP ADDRESS: a failed DNS lookup blocks loop() for a fixed 15 seconds.
+// Find the JSON path with: curl http://<ip>:8080/aircraft
+// #define FEATURE_LOCAL_RX 1
+// #define LOCAL_RX_HOST "192.168.1.243"
+// #define LOCAL_RX_PORT 8080
+// #define LOCAL_RX_PATH "/aircraft"
