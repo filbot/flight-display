@@ -103,6 +103,7 @@ Examples:
 
 ## Key Patterns
 
+- **Nearest means nearest — including aircraft on the ground.** Deliberate product decision (2026-08-24): a parked or taxiing aircraft at `alt = GND` is shown if it is the closest, and is NOT deprioritised in favour of airborne traffic. Measured consequence, which is expected and must not be "fixed": ~50% of the time the display shows surface traffic (Boeing Field and SEA are both inside the 10 km circle), and those aircraft often broadcast no position, so the live local refresh cannot update them and the screen sits static for 30s+ at a time. That is accurate — a stationary aircraft's distance genuinely is not changing. Airborne aircraft update every ~5s.
 - **Classification priority**: dbFlags military bit → seat count (≤15 = PVT) → ADS-B category (runs whenever seats didn't classify) → callsign presence (has callsign = COM, else PVT). `classifyOp()` does no network I/O at all.
 - **Aircraft lookup**: Binary search on sorted, unique-key `kTypeInfo[]` by ICAO only (no IATA fallback — API `t` is always ICAO), then ~15 family-prefix heuristics. Unknown types fall back to the API `desc` field, then the raw code.
 - **Staleness**: Positions without fresh `seen_pos` are rejected. Displayed flight clears to splash after `STALE_DISPLAY_MAX_MS` (default 5 min) without a successful refresh; an empty-but-valid API response ("no aircraft nearby") clears immediately and doesn't count as a fetch failure.

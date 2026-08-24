@@ -6,6 +6,36 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## Decision 2026-08-24: nearest means nearest, ground aircraft included
+
+A 20.8-minute watch showed the display sitting static for 30s+ stretches (worst
+124s) whenever the nearest aircraft was on the ground — 30 consecutive `nopos`
+results, because surface traffic frequently transmits without a usable position.
+Half the window was spent on ground aircraft, since Boeing Field and SEA are both
+inside the 10 km circle.
+
+**Filip's call: leave it. If the nearest aircraft is on the ground, show it.**
+
+So this is NOT a defect and must not be "optimised" later:
+
+- Do not skip `alt = GND` aircraft in `selectAircraft()`.
+- Do not add a distance penalty for surface traffic.
+- A frozen distance on a parked aircraft is *correct* — it is not moving.
+
+Measured behaviour to expect, for reference when something looks wrong:
+
+| | median gap between display updates | worst |
+|---|---|---|
+| airborne | 5s | — |
+| ground | 31s | 186s |
+
+Local-refresh hit rate over the full window was **71%** (213 ok, 40 `nopos`,
+40 `stale`, 6 not-found, 10 skipped). An earlier "100%" figure was a favourable
+5-minute sample of airborne traffic and should not be treated as the baseline.
+
+---
+
+
 ## 2026-08-24: "distance and altitude don't change often enough" — validated
 
 Filip reported intermittent freezes. The update path itself is **correct**:
