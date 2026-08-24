@@ -435,6 +435,16 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 #endif
 
 // Declared ahead of the HTTP handlers so /healthz can report what's on screen
+// Performance counters. The central question on this device is what blocks
+// loop() and for how long: OTA, the HTTP server and the display all live there,
+// and the task watchdog fires at 25s. Measured as the interval between
+// successive loop() entries, which for a cooperative loop IS the iteration
+// duration, and which needs no instrumentation at the many early returns.
+static uint32_t g_loopCount = 0, g_loopMaxMs = 0;
+static uint32_t g_loopSlow50 = 0, g_loopSlow500 = 0, g_loopSlow5000 = 0;
+static uint32_t g_renderCount = 0, g_renderMaxMs = 0;
+static uint32_t g_apiMsLast = 0, g_apiMsMax = 0;
+static uint32_t g_localMsLast = 0, g_localMsMax = 0;
 #if FEATURE_LOCAL_RX
 static uint32_t g_nextLocalAt = 0;
 static uint32_t g_statLocalOk = 0, g_statLocalMiss = 0, g_statLocalFail = 0;
@@ -492,6 +502,17 @@ static void httpHandleHealth() {
 #endif
   d["wifi_drop_active"] = (g_wifiDropUntil != 0);
   d["splash_draws"] = g_statSplashDraws;
+  d["loop_count"] = g_loopCount;
+  d["loop_max_ms"] = g_loopMaxMs;
+  d["loop_gt50ms"] = g_loopSlow50;
+  d["loop_gt500ms"] = g_loopSlow500;
+  d["loop_gt5s"] = g_loopSlow5000;
+  d["render_count"] = g_renderCount;
+  d["render_max_ms"] = g_renderMaxMs;
+  d["api_ms_last"] = g_apiMsLast;
+  d["api_ms_max"] = g_apiMsMax;
+  d["local_ms_last"] = g_localMsLast;
+  d["local_ms_max"] = g_localMsMax;
   d["shift_idx"] = pixelShiftIdx();
   d["alt_ft"] = g_lastShown.altitudeFt;
   d["dist_km"] = isnan(g_lastShown.distanceKm) ? -1.0 : g_lastShown.distanceKm;
@@ -1152,7 +1173,10 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
   // never left the device and adsb.lol saw the generic built-in UA and 403'd us.
   http.setUserAgent(API_USER_AGENT);
 
+  uint32_t apiStart = millis();
   int code = http.GET();
+  g_apiMsLast = millis() - apiStart;
+  if (g_apiMsLast > g_apiMsMax) g_apiMsMax = g_apiMsLast;
   g_statLastHttp = code;
   // Cleared on every attempt: this field used to keep the last message that
   // happened to fail, so /healthz reported "Too Many Requests" alongside a 200
@@ -1242,6 +1266,7 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
 static void refreshFromLocalReceiver() {
   if (!g_haveDisplayed || !g_lastShown.hex[0]) return;
   if (WiFi.status() != WL_CONNECTED) return;
+  uint32_t localStart = millis();
 
   WiFiClient client;  // plain HTTP on the LAN: no TLS, and an IP so no DNS
   HTTPClient http;
@@ -1284,6 +1309,9 @@ static void refreshFromLocalReceiver() {
     g_nextLocalAt = millis() + LOCAL_RX_BACKOFF_MS;
     return;
   }
+
+  g_localMsLast = millis() - localStart;
+  if (g_localMsLast > g_localMsMax) g_localMsMax = g_localMsLast;
 
   for (JsonObject a : doc["aircraft"].as<JsonArray>()) {
     const char* hx = a["hex"].isNull() ? nullptr : a["hex"].as<const char*>();
@@ -1408,6 +1436,8 @@ static void drawBottomBar(const FlightInfo &fi, bool isPseudo, int16_t yBottom) 
 }
 
 static void renderFlight(const FlightInfo &fi) {
+  uint32_t renderStart = millis();
+  g_renderCount++;
   g_splashActive = false;
   setDisplayDim(false);
   u8g2.clearBuffer();
@@ -1530,6 +1560,7 @@ static void renderFlight(const FlightInfo &fi) {
     u8g2.setDrawColor(1);
 #endif
     u8g2.sendBuffer();
+    { uint32_t d = millis() - renderStart; if (d > g_renderMaxMs) g_renderMaxMs = d; }
     return;
   }
 
@@ -1553,6 +1584,7 @@ static void renderFlight(const FlightInfo &fi) {
   drawBottomBar(fi, isPseudo, yBottom);
 
   u8g2.sendBuffer();
+  { uint32_t d = millis() - renderStart; if (d > g_renderMaxMs) g_renderMaxMs = d; }
 }
 
 void setup() {
@@ -1658,6 +1690,22 @@ static void expireStaleDisplay() {
 }
 
 void loop() {
+  {
+    // Interval since the previous entry == duration of the previous iteration,
+    // so every early return below is accounted for without touching any of them.
+    static uint32_t s_lastEntry = 0;
+    uint32_t entry = millis();
+    if (s_lastEntry) {
+      uint32_t d = entry - s_lastEntry;
+      if (d > g_loopMaxMs) g_loopMaxMs = d;
+      if (d > 50) g_loopSlow50++;
+      if (d > 500) g_loopSlow500++;
+      if (d > 5000) g_loopSlow5000++;
+    }
+    s_lastEntry = entry;
+    g_loopCount++;
+  }
+
   if (g_wifiDropUntil && (int32_t)(millis() - g_wifiDropUntil) >= 0) {
     g_wifiDropUntil = 0;
     // Auto-reconnect stays off: connectWiFi() is now the only thing that can

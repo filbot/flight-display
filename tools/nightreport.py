@@ -188,6 +188,44 @@ def main():
         W(f"- {passes} complete overnight pass(es).")
     W("")
 
+    # ---- performance
+    W("## Performance\n")
+    if h and "loop_count" in h[-1]:
+        per = [x for x in h if "loop_count" in x]
+        # counters are cumulative since boot, so work in deltas and drop the
+        # pairs that straddle a reboot
+        pairs = [(a, b) for a, b in zip(per, per[1:]) if b["loop_count"] > a["loop_count"]]
+        if pairs:
+            def rate(key):
+                tot = sum(b[key] - a[key] for a, b in pairs)
+                secs = sum((b["uptime_ms"] - a["uptime_ms"]) / 1000.0 for a, b in pairs)
+                return tot, (tot / secs if secs else 0), secs
+            it, ips, secs = rate("loop_count")
+            W(f"- Loop: {it:,} iterations over {secs/3600:.1f}h = **{ips:.0f}/s**. "
+              f"Worst single iteration seen: **{max(x['loop_max_ms'] for x in per)} ms** "
+              f"(task watchdog fires at {25_000} ms).")
+            for k, label in (("loop_gt50ms", ">50ms"), ("loop_gt500ms", ">500ms"), ("loop_gt5s", ">5s")):
+                if k in per[-1]:
+                    tot, r, _ = rate(k)
+                    W(f"  - iterations {label}: {tot:,} ({r*60:.1f}/min)")
+            rc, rr, _ = rate("render_count")
+            W(f"- Renders: {rc:,} ({rr*60:.1f}/min), worst "
+              f"**{max(x['render_max_ms'] for x in per)} ms**.")
+            W(f"- API fetch: worst **{max(x['api_ms_max'] for x in per)} ms**, "
+              f"last {per[-1]['api_ms_last']} ms.")
+            if "local_ms_max" in per[-1]:
+                W(f"- Local receiver fetch: worst **{max(x['local_ms_max'] for x in per)} ms**, "
+                  f"last {per[-1]['local_ms_last']} ms.")
+                lo, lm, lf = per[-1].get("local_ok",0), per[-1].get("local_miss",0), per[-1].get("local_fail",0)
+                tot = lo + lm + lf
+                W(f"  - outcomes: ok {lo:,}, miss {lm:,}, fail {lf:,}"
+                  + (f" ({100.0*lf/tot:.1f}% fail)" if tot else ""))
+            # what share of wall-clock is spent blocked
+            blk50, _, secs = rate("loop_gt50ms")
+            W(f"- Blocking budget: the loop runs at ~{ips:.0f}/s, so anything over "
+              f"50 ms is an outlier; {blk50:,} occurred in {secs/3600:.1f}h.")
+    W("")
+
     W("## Findings\n")
     W("See `docs/findings.md` — that file is hand-maintained and is the durable record.\n")
 
