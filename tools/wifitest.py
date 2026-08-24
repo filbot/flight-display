@@ -75,13 +75,13 @@ def main():
     lines = serial_since(mark)
 
     def has(pat):
-        return [l for l in lines if re.search(pat, l)]
+        return [l for l in lines if re.search(pat, l, re.IGNORECASE)]
 
     dropped = has(r"TEST: dropping Wi-Fi")
     disc = has(r"WiFi disconnected\. Reason: (\d+)")
     expired = has(r"TEST: Wi-Fi hold expired")
     retried = has(r"WiFi retry: calling WiFi\.begin")
-    gotip = has(r"Got IP")
+    gotip = has(r"got IP")
     stale = has(r"Displayed data stale")
     breaker = has(r"API unreachable for")
     crash = has(r"Guru Meditation|task_wdt|Backtrace:")

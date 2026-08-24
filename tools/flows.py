@@ -72,6 +72,24 @@ def reqs_since(mark):
     return out
 
 
+def wait_net_idle(timeout=45):
+    """Block until no network job is in flight.
+
+    Fetches run on their own task now, so a request from the previous cycle can
+    still be outstanding when a test starts counting — which made request-count
+    assertions intermittently see one extra search. Marking only once the task
+    is idle makes those counts deterministic again."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if not health().get("net_busy"):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
 def req_count():
     return sum(1 for _ in open(REQ_LOG)) if os.path.exists(REQ_LOG) else 0
 
@@ -100,6 +118,7 @@ def check(name, ok, detail, why):
 def t_radius_conversion(mock):
     """SEARCH_RADIUS_KM is real km; the API parameter is nautical miles."""
     set_mode("ok")
+    wait_net_idle()
     mark = req_count()
     c = health()
     force_fetch(mock)
@@ -115,6 +134,7 @@ def t_radius_conversion(mock):
 
 def t_home_coords(mock):
     """The URL must carry the configured home position."""
+    wait_net_idle()
     mark = req_count()
     c = health()
     force_fetch(mock)
@@ -129,6 +149,7 @@ def t_home_coords(mock):
 def t_tiered_fallback(mock):
     """Never exercised before: the widened search only fires on an empty primary."""
     set_mode("far")  # nothing inside the primary circle, one aircraft beyond it
+    wait_net_idle()
     mark = req_count()
     c = health()
     force_fetch(mock)
@@ -147,6 +168,7 @@ def t_tiered_fallback(mock):
 def t_no_widen_when_found(mock):
     """The widened search must NOT fire when the primary circle has an aircraft."""
     set_mode("ok")
+    wait_net_idle()
     mark = req_count()
     c = health()
     force_fetch(mock)
@@ -165,6 +187,7 @@ def t_no_widen_when_found(mock):
 def t_user_agent(mock):
     """The device must send a contact-carrying UA; the mock 403s generic ones."""
     set_mode("uaenforce")
+    wait_net_idle()
     mark = req_count()
     c = health()
     force_fetch(mock)
@@ -274,6 +297,7 @@ def t_normal_squawk_ignored(mock):
 def t_uses_point_endpoint(mock):
     """The primary search must use /v2/point; the fallback must stay /v2/closest."""
     set_mode("far")  # empty primary forces the widened fallback too
+    wait_net_idle()
     mark = req_count()
     c = health()
     force_fetch(mock)

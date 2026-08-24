@@ -35,6 +35,10 @@ enum FetchResult : uint8_t { FETCH_OK, FETCH_EMPTY, FETCH_FAIL };
 
 // FlightInfo is used across parsing, test overrides, and rendering.
 // Uses fixed char arrays to avoid heap allocation in hot paths.
+// Ahead of the first function definition in the file: the Arduino build injects
+// generated prototypes before that point, and they reference this type.
+enum NetJob : uint8_t { NET_NONE = 0, NET_API, NET_LOCAL };
+
 struct FlightInfo {
   char ident[16];      // flight/callsign or registration/hex fallback
   char typeCode[8];    // aircraft type (t)
@@ -456,6 +460,21 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 #endif
 
 // Declared ahead of the HTTP handlers so /healthz can report what's on screen
+static SemaphoreHandle_t g_netMtx = nullptr;
+static TaskHandle_t g_netTaskHandle = nullptr;
+static NetJob g_netPending = NET_NONE;   // requested by loop()
+static NetJob g_netDoneKind = NET_NONE;
+static bool g_netBusy = false;
+static bool g_netDone = false;
+static FlightInfo g_netTarget;           // NET_LOCAL: the aircraft to refresh
+static FlightInfo g_netResult;
+static FetchResult g_netStatus = FETCH_FAIL;
+static uint32_t g_netBusySince = 0;
+static uint32_t g_statNetJobs = 0;
+
+#define NET_LOCK()   xSemaphoreTake(g_netMtx, portMAX_DELAY)
+#define NET_UNLOCK() xSemaphoreGive(g_netMtx)
+
 // Why a fetch came back empty: how many aircraft the API sent, and how many
 // we rejected on position or staleness. Logged identically before, which made
 // a genuinely clear sky indistinguishable from us discarding everything.
@@ -530,6 +549,13 @@ static void httpHandleHealth() {
   d["local_skip"] = g_statLocalSkip;
   d["local_nopos"] = g_statLocalNoPos;
   d["local_stale"] = g_statLocalStale;
+  d["net_jobs"] = g_statNetJobs;
+  {
+    NET_LOCK();
+    d["net_busy"] = g_netBusy;
+    d["net_busy_ms"] = g_netBusy ? (millis() - g_netBusySince) : 0;
+    NET_UNLOCK();
+  }
   d["last_ac_returned"] = g_lastAcReturned;
   d["last_ac_rejected"] = g_lastAcRejected;
   d["local_seen_pos"] = g_localSeenPos;
@@ -908,8 +934,7 @@ static void connectWiFi() {
   if (!wifiInitialized) return;
   // First attempt
   if (!wifiEverBegun) {
-    Serial.print("[WiFi] Connecting to ");
-    Serial.println(WIFI_SSID);
+    LOG_INFO("WiFi: connecting to %s", WIFI_SSID);
     showSplash("Connecting Wi-Fi...", WIFI_SSID);
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     wifiConnecting = true;
@@ -1194,7 +1219,12 @@ static bool resolveApiHost(const char* base) {
   uint32_t t0 = millis();
   bool ok = (WiFi.hostByName(host, ip) == 1);
   uint32_t took = millis() - t0;
-  esp_task_wdt_reset();  // the lookup is its own span; start the fetch fresh
+  // No esp_task_wdt_reset() here any more: this runs on the network task, which
+  // is deliberately not subscribed to the TWDT. Calling it from an unsubscribed
+  // task returns ESP_ERR_NOT_FOUND and logs an error every time — enough serial
+  // spam to corrupt the capture. Splitting DNS from connect+read still matters
+  // for the fast-exit on failure; the watchdog protection now comes from loop()
+  // never blocking at all.
   if (!ok) {
     LOG_WARN("DNS lookup for %s failed after %lu ms", host, (unsigned long)took);
     return false;
@@ -1237,7 +1267,7 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
   // from _tcpTimeout, and Stream::setTimeout takes MILLISECONDS while this once
   // passed seconds — a discrepancy that looked like a bug and was merely dead.
   if (!http.begin(client, url)) {
-    Serial.println("[HTTP] begin() failed (TLS)");
+    LOG_WARN("HTTP begin() failed (TLS)");
     return FETCH_FAIL;
   }
   http.addHeader("Accept", "application/json");
@@ -1347,19 +1377,22 @@ static FetchResult fetchClosestAt(double radiusKm, FlightInfo &out, bool allAirc
 //
 // Safe because dump1090 records are flat — arrays like "mlat":[] appear, but no
 // nested objects — so the first '}' after the needle ends the record.
-static void refreshFromLocalReceiver() {
-  if (!g_haveDisplayed || !g_lastShown.hex[0]) return;
-  if (WiFi.status() != WL_CONNECTED) return;
+// Fills `io` (which arrives as a copy of the aircraft on screen) with a fresher
+// position and altitude. Pure producer: no globals for display state, no
+// rendering — both belong to loop().
+static bool fetchLocalUpdate(FlightInfo &io) {
+  if (!io.hex[0]) return false;
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   // Skip aircraft the receiver realistically cannot hear, rather than paying a
   // fetch to rediscover that. Overnight this was 70% of all lookups.
-  if (!isnan(g_lastShown.distanceKm) && g_lastShown.distanceKm > LOCAL_RX_MAX_DIST_KM) {
+  if (!isnan(io.distanceKm) && io.distanceKm > LOCAL_RX_MAX_DIST_KM) {
     g_statLocalSkip++;
-    return;
+    return false;
   }
-  if (strcasecmp(g_localMissHex, g_lastShown.hex) == 0 && g_localMissRun >= LOCAL_RX_MISS_GIVEUP) {
+  if (strcasecmp(g_localMissHex, io.hex) == 0 && g_localMissRun >= LOCAL_RX_MISS_GIVEUP) {
     g_statLocalSkip++;
-    return;
+    return false;
   }
   uint32_t localStart = millis();
 
@@ -1374,7 +1407,7 @@ static void refreshFromLocalReceiver() {
   if (!http.begin(client, url)) {
     g_statLocalFail++;
     g_nextLocalAt = millis() + LOCAL_RX_BACKOFF_MS;
-    return;
+    return false;
   }
   int code = http.GET();
   int contentLen = http.getSize();
@@ -1383,11 +1416,11 @@ static void refreshFromLocalReceiver() {
     g_statLocalFail++;
     LOG_WARN("Local receiver HTTP %d; backing off", code);
     g_nextLocalAt = millis() + LOCAL_RX_BACKOFF_MS;
-    return;
+    return false;
   }
 
   char hexLower[8];
-  strncpy(hexLower, g_lastShown.hex, sizeof(hexLower) - 1);
+  strncpy(hexLower, io.hex, sizeof(hexLower) - 1);
   hexLower[sizeof(hexLower) - 1] = '\0';
   for (char *c = hexLower; *c; ++c) *c = tolower(*c);
 
@@ -1405,7 +1438,7 @@ static void refreshFromLocalReceiver() {
   if (truncated) {
     g_statLocalFail++;
     LOG_WARN("Local record for %s exceeded %u bytes", hexLower, (unsigned)sizeof(record));
-    return;
+    return false;
   }
   if (!found) {
     // Whether we saw the WHOLE body matters: a short read means the aircraft
@@ -1413,21 +1446,21 @@ static void refreshFromLocalReceiver() {
     LOG_WARN("Local miss for %s after %u of %d bytes", hexLower,
              (unsigned)scanned, (int)contentLen);
     g_statLocalMiss++;
-    if (strcasecmp(g_localMissHex, g_lastShown.hex) != 0) {
-      strncpy(g_localMissHex, g_lastShown.hex, sizeof(g_localMissHex) - 1);
+    if (strcasecmp(g_localMissHex, io.hex) != 0) {
+      strncpy(g_localMissHex, io.hex, sizeof(g_localMissHex) - 1);
       g_localMissHex[sizeof(g_localMissHex) - 1] = '\0';
       g_localMissRun = 1;
     } else if (g_localMissRun < 255) {
       g_localMissRun++;
     }
-    return;
+    return false;
   }
 
   StaticJsonDocument<512> doc;
   if (deserializeJson(doc, record)) {
     g_statLocalFail++;
     LOG_WARN("Local record parse error");
-    return;
+    return false;
   }
   JsonObject a = doc.as<JsonObject>();
 
@@ -1436,16 +1469,16 @@ static void refreshFromLocalReceiver() {
   // into one counter, which made a working path look broken.
   if (a["seen_pos"].isNull() || a["lat"].isNull() || a["lon"].isNull()) {
     g_statLocalNoPos++;
-    return;
+    return false;
   }
   float age = a["seen_pos"].as<float>();
   if (age > LOCAL_RX_MAX_AGE_S) {
     g_statLocalStale++;
     g_localSeenPos = age;
-    return;
+    return false;
   }
 
-  FlightInfo upd = g_lastShown;  // identity and classification untouched
+  FlightInfo upd = io;  // identity and classification untouched
   upd.lat = a["lat"].as<double>();
   upd.lon = a["lon"].as<double>();
   upd.distanceKm = haversineKm(HOME_LAT, HOME_LON, upd.lat, upd.lon);
@@ -1459,14 +1492,64 @@ static void refreshFromLocalReceiver() {
   g_localSeenPos = age;
   g_statLocalOk++;
   g_localMissRun = 0;
-  // sameFlightDisplay() already ignores sub-0.1km jitter, so this only redraws
-  // when a cell would actually read differently.
-  if (!sameFlightDisplay(upd, g_lastShown)) {
-    g_lastShown = upd;
-    renderFlight(g_lastShown);
-  }
+  io = upd;
+  return true;
 }
 #endif  // FEATURE_LOCAL_RX
+
+// ---------------------------------------------------------------------------
+// Network I/O runs on its own task.
+//
+// A fetch can legitimately occupy ~31s: lwIP DNS resolution is not bounded by
+// HTTP_CONNECT_TIMEOUT_MS and takes a fixed ~15s when it fails (finding #14), on
+// top of an 8s connect and an 8s read. Held inside loop() that starved OTA and
+// the HTTP server and twice tripped the 25s task watchdog in production.
+//
+// Deliberately narrow: the task performs ONLY the blocking call and hands back a
+// result. Every decision — backoff, the circuit breaker, staleness, relays and
+// all rendering — stays in loop(), because u8g2 and the SPI bus are not thread
+// safe and because keeping the logic in one place is what makes this reviewable.
+// ---------------------------------------------------------------------------
+#ifndef NET_TASK_STACK
+#define NET_TASK_STACK 16384   // mbedTLS plus ArduinoJson filtering needs room
+#endif
+// A job outlasting this is hung rather than slow: the longest legitimate fetch
+// is DNS(15s) + connect(8s) + read(8s), doubled at worst for a widened search.
+#ifndef NET_STALL_RESTART_MS
+#define NET_STALL_RESTART_MS 180000
+#endif
+
+// True only when nothing is queued, running, or waiting to be collected.
+static bool netIdle() {
+  NET_LOCK();
+  bool r = (g_netPending == NET_NONE && !g_netBusy && !g_netDone);
+  NET_UNLOCK();
+  return r;
+}
+
+static bool netRequest(NetJob job, const FlightInfo *target) {
+  NET_LOCK();
+  bool ok = (g_netPending == NET_NONE && !g_netBusy && !g_netDone);
+  if (ok) {
+    g_netPending = job;
+    if (target) g_netTarget = *target;
+  }
+  NET_UNLOCK();
+  return ok;
+}
+
+static bool netCollect(NetJob &kind, FlightInfo &out, FetchResult &st) {
+  NET_LOCK();
+  bool ok = g_netDone;
+  if (ok) {
+    kind = g_netDoneKind;
+    out = g_netResult;
+    st = g_netStatus;
+    g_netDone = false;
+  }
+  NET_UNLOCK();
+  return ok;
+}
 
 // Primary radius first; widen only when the nearby sky is empty, so the
 // display always has an aircraft when anything is in range while keeping
@@ -1516,7 +1599,8 @@ static FetchResult fetchNearestFlight(FlightInfo &out) {
   if (fr == FETCH_EMPTY && SEARCH_RADIUS_FALLBACK_KM > SEARCH_RADIUS_KM) {
     LOG_INFO("Nothing within %d km, widening to %d km",
              (int)SEARCH_RADIUS_KM, (int)SEARCH_RADIUS_FALLBACK_KM);
-    esp_task_wdt_reset();  // two fetches must never share one un-fed span
+    // (No watchdog feed needed between the two fetches: neither runs on the
+    // watchdogged task any more.)
     // /v2/point, not /v2/closest. The single aircraft /v2/closest returns may
     // fail the position-freshness gate, and rejecting it declared the entire
     // 100 km ring empty — showing "No aircraft nearby" over a busy sky. With
@@ -1759,10 +1843,12 @@ void setup() {
 
   Serial.begin(115200);
   delay(20);
-  Serial.println(F("\n[Boot] Flight Display starting..."));
+  // Before the first log line: three tasks (loop, network, Wi-Fi events) all
+  // write to Serial, and unguarded writes shred each other's lines.
+  logInit();
+  LOG_INFO("Boot: Flight Display starting");
 #if defined(ESP32)
-  Serial.print(F("[Boot] Reset reason: "));
-  Serial.println(resetReasonStr());
+  LOG_INFO("Boot: reset reason %s", resetReasonStr());
   // The Arduino core initializes the TWDT at 5s but only watches the idle task.
   // Widen it and subscribe loopTask so a wedged loop() reboots instead of
   // hanging silently forever on a 24/7 device.
@@ -1792,8 +1878,7 @@ void setup() {
 #endif
         break;
       case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-        Serial.print(F("[WiFi] Got IP: "));
-        Serial.println(IPAddress(info.got_ip.ip_info.ip.addr));
+        LOG_INFO("WiFi: got IP %s", IPAddress(info.got_ip.ip_info.ip.addr).toString().c_str());
         wifiConnecting = false;
         // Raise TX power after association; disable modem sleep for responsiveness
         WiFi.setTxPower(WIFI_RUN_TXPOWER);
@@ -1804,7 +1889,7 @@ void setup() {
         // full interval after recovery (measured at 26s before this line).
         g_nextFetchAt = millis();
         // Wi‑Fi up; print reminder of server endpoint
-        Serial.println(F("[HTTP] Server ready on port 80"));
+        LOG_INFO("HTTP server ready on port 80");
 #if FEATURE_OTA
         otaBeginOnce();
 #endif
@@ -1823,6 +1908,12 @@ void setup() {
   WiFi.setTxPower(WIFI_BOOT_TXPOWER);
   WiFi.setSleep(true);
   wifiInitialized = true;
+
+  // Network task on core 0, away from the rendering that loop() does on core 1.
+  g_netMtx = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(netTaskFn, "net", NET_TASK_STACK, nullptr, 1,
+                          &g_netTaskHandle, 0);
+  LOG_INFO("Network task started (%d byte stack)", (int)NET_TASK_STACK);
   // Display init (U8g2 handles SPI HW init for HW SPI constructor)
   if (!u8g2.begin()) {
     LOG_ERROR("Display init failed");
@@ -1839,6 +1930,50 @@ void setup() {
   // Start HTTP listener early; it will become reachable after Wi‑Fi is up
   httpStartOnce();
 #endif
+}
+
+// The only place that blocks on the network. Never subscribed to the task
+// watchdog: a 31s DNS-plus-connect-plus-read is legitimate here, and the point
+// of moving it off loop() was precisely so it cannot trip that watchdog. A
+// genuinely hung job is caught instead by the stall check in loop().
+static void netTaskFn(void *) {
+  for (;;) {
+    NetJob job = NET_NONE;
+    FlightInfo target;
+
+    NET_LOCK();
+    if (g_netPending != NET_NONE && !g_netDone) {
+      job = g_netPending;
+      g_netPending = NET_NONE;
+      target = g_netTarget;
+      g_netBusy = true;
+      g_netBusySince = millis();
+    }
+    NET_UNLOCK();
+
+    if (job == NET_NONE) {
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+
+    FlightInfo out;
+    FetchResult st = FETCH_FAIL;
+    if (job == NET_API) {
+      st = fetchNearestFlight(out);
+    } else {
+      out = target;
+      st = fetchLocalUpdate(out) ? FETCH_OK : FETCH_FAIL;
+    }
+
+    NET_LOCK();
+    g_netResult = out;
+    g_netStatus = st;
+    g_netDoneKind = job;
+    g_netBusy = false;
+    g_netDone = true;
+    g_statNetJobs++;
+    NET_UNLOCK();
+  }
 }
 
 // Stop showing a flight that can no longer be refreshed and put the dimmed
@@ -1931,24 +2066,100 @@ void loop() {
 #endif
 
 #if FEATURE_LOCAL_RX
-  // Keep the live numbers current between API polls.
-  if ((int32_t)(millis() - g_nextLocalAt) >= 0) {
-    g_nextLocalAt = millis() + LOCAL_RX_INTERVAL_MS;
-    refreshFromLocalReceiver();
+  // Keep the live numbers current between API polls. Only ever a request —
+  // the blocking fetch happens on the network task.
+  if ((int32_t)(millis() - g_nextLocalAt) >= 0 && g_haveDisplayed && g_lastShown.hex[0]) {
+    if (netRequest(NET_LOCAL, &g_lastShown)) {
+      g_nextLocalAt = millis() + LOCAL_RX_INTERVAL_MS;
+    }
   }
 #endif
 
   uint32_t now = millis();
-  // Rollover-safe: signed difference handles millis() wrap at ~49.7 days
+
+  // ---- 1. Apply anything the network task has finished ----
+  // Collected FIRST, unconditionally. Putting this after the "is a fetch due"
+  // branch deadlocked the whole thing: g_nextFetchAt only advances when a result
+  // is applied, so the due branch stayed true forever and returned before ever
+  // reaching the collect.
+  {
+    NetJob kind = NET_NONE;
+    FlightInfo nearest;
+    FetchResult fr = FETCH_FAIL;
+    if (netCollect(kind, nearest, fr)) {
+#if FEATURE_LOCAL_RX
+      if (kind == NET_LOCAL) {
+        // Discard if the display moved to a different aircraft while this was in
+        // flight — the position would belong to the wrong airframe.
+        if (fr == FETCH_OK && g_haveDisplayed
+            && strcasecmp(nearest.hex, g_lastShown.hex) == 0
+            && !sameFlightDisplay(nearest, g_lastShown)) {
+          g_lastShown = nearest;
+          renderFlight(g_lastShown);
+        }
+        yield();
+        return;
+      }
+#endif
+      if (fr == FETCH_OK) {
+        g_statOk++;
+        g_fetchFailCount = 0;
+        g_lastDataMs = millis();
+        g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
+        if (!g_haveDisplayed || !sameFlightDisplay(nearest, g_lastShown)) {
+          renderFlight(nearest);
+          g_lastShown = nearest;
+          g_haveDisplayed = true;
+          relaysShowCategory(g_lastShown.opClass);
+        }
+      } else if (fr == FETCH_EMPTY) {
+        g_statEmpty++;
+        g_fetchFailCount = 0;
+        g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
+        if (g_haveDisplayed) {
+          g_haveDisplayed = false;
+          g_lastShown = FlightInfo();
+        }
+        showSplash("No aircraft nearby");
+      } else {
+        g_statFail++;
+        if (WiFi.status() == WL_CONNECTED) {
+          g_fetchFailCount = min((uint8_t)(g_fetchFailCount + 1), (uint8_t)255);
+          if (g_fetchFailCount >= FETCH_FAIL_RESTART_THRESHOLD) {
+            LOG_ERROR("API unreachable for %d attempts, restarting", g_fetchFailCount);
+            ESP.restart();
+          }
+        }
+        uint32_t retryMs = backoffMs(max(g_fetchFailCount, (uint8_t)1));
+        g_nextFetchAt = millis() + retryMs;
+        LOG_WARN("Fetch failed (attempt %d), next retry in %lu ms",
+                 g_fetchFailCount, (unsigned long)retryMs);
+        expireStaleDisplay();
+      }
+      yield();
+      return;
+    }
+  }
+
+  // ---- 2. A wedged job is caught here; nothing else would notice ----
+  {
+    NET_LOCK();
+    bool stuck = g_netBusy && (millis() - g_netBusySince) > NET_STALL_RESTART_MS;
+    NET_UNLOCK();
+    if (stuck) {
+      LOG_ERROR("Network task stalled > %lu ms, restarting",
+                (unsigned long)NET_STALL_RESTART_MS);
+      ESP.restart();
+    }
+  }
+
+  // ---- 3. Ask for a new fetch when one is due ----
   if ((int32_t)(now - g_nextFetchAt) >= 0) {
     checkHeap();
 
     // A down link is not a failed fetch — no attempt was made. Counting it as
     // one froze g_fetchFailCount at 0 (correctly, so the API circuit breaker
-    // cannot misfire) which in turn pinned the retry interval at the backoff
-    // floor of ~4.3s, spending a long outage re-failing and redrawing the
-    // splash ~840 times an hour. Reschedule at the normal interval instead and
-    // let the display age out exactly as it would otherwise.
+    // cannot misfire) which pinned the retry interval at the backoff floor.
     static bool s_linkDown = false;
     if (WiFi.status() != WL_CONNECTED) {
       if (!s_linkDown) {
@@ -1964,48 +2175,7 @@ void loop() {
       s_linkDown = false;
       LOG_INFO("Wi-Fi back; resuming fetches");
     }
-
-    FlightInfo nearest;
-    FetchResult fr = fetchNearestFlight(nearest);
-    if (fr == FETCH_OK) {
-      g_statOk++;
-      g_fetchFailCount = 0;
-      g_lastDataMs = millis();
-      g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
-      if (!g_haveDisplayed || !sameFlightDisplay(nearest, g_lastShown)) {
-        renderFlight(nearest);
-        g_lastShown = nearest;
-        g_haveDisplayed = true;
-        relaysShowCategory(g_lastShown.opClass);
-      }
-    } else if (fr == FETCH_EMPTY) {
-      g_statEmpty++;
-      // API healthy, sky quiet: normal interval, no failure count, and don't
-      // keep showing an aircraft the API says is no longer there
-      g_fetchFailCount = 0;
-      g_nextFetchAt = millis() + FETCH_INTERVAL_MS;
-      if (g_haveDisplayed) {
-        g_haveDisplayed = false;
-        g_lastShown = FlightInfo();
-      }
-      showSplash("No aircraft nearby");
-    } else {
-      g_statFail++;
-      // Wi-Fi outages don't feed the restart breaker — the reconnect logic
-      // owns those; the breaker is for "API unreachable despite Wi-Fi up"
-      if (WiFi.status() == WL_CONNECTED) {
-        g_fetchFailCount = min((uint8_t)(g_fetchFailCount + 1), (uint8_t)255);
-        // Circuit breaker: restart after sustained failures to recover network stack
-        if (g_fetchFailCount >= FETCH_FAIL_RESTART_THRESHOLD) {
-          LOG_ERROR("API unreachable for %d attempts, restarting", g_fetchFailCount);
-          ESP.restart();
-        }
-      }
-      uint32_t retryMs = backoffMs(max(g_fetchFailCount, (uint8_t)1));
-      g_nextFetchAt = millis() + retryMs;
-      LOG_WARN("Fetch failed (attempt %d), next retry in %lu ms", g_fetchFailCount, (unsigned long)retryMs);
-      expireStaleDisplay();
-    }
+    netRequest(NET_API, nullptr);
   }
 
   // Keep relays consistent during boot

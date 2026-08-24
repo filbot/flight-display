@@ -6,6 +6,70 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-24: #14 fixed — network I/O moved off loop()
+
+| # | Severity | Finding | Status |
+|---|---|---|---|
+| 14 | medium | A fetch that cannot resolve DNS blocks `loop()` for ~15s; combined with connect and read, one fetch could hold a single iteration for ~31s against a 25s watchdog. | **fixed 2026-08-24** |
+
+A dedicated FreeRTOS task (`netTaskFn`, core 0, 16 KB stack) now performs the
+blocking calls. Deliberately narrow: the task does **only** the I/O and hands
+back a result. Backoff, the circuit breaker, staleness, relays and all rendering
+stay in `loop()`, because u8g2 and SPI are not thread safe and because keeping
+the decisions in one place is what makes it reviewable.
+
+The task is **not** subscribed to the task watchdog — a 31s fetch is legitimate
+there, and the whole point was that it can no longer stall the watchdogged task.
+A genuinely wedged job is caught by a stall check in `loop()`
+(`NET_STALL_RESTART_MS`, 3 min).
+
+**Measured:**
+
+| | before | after |
+|---|---|---|
+| worst `loop()` iteration | **8065 ms** | **17-18 ms** |
+| iterations >500 ms | 897 per 7.6h | **0** |
+| iterations >5 s | 67 per 7.6h | **0** |
+
+Even after a fault suite containing a 40s slow response and a hang mode,
+`loop_max` stayed at 18 ms with zero iterations over 50 ms. The network can hang
+for 40 seconds and the loop does not notice. Cost: ~18 KB of heap for the task
+stack (195 KB -> 177 KB free), min-ever still 122 KB.
+
+### Three bugs this change introduced, all caught before commit
+
+1. **Deadlock on first fetch.** The collect step sat *after* the "is a fetch due"
+   branch, but `g_nextFetchAt` only advances when a result is applied — so the
+   due branch stayed true forever and returned before ever collecting. One job
+   ran, then nothing. Collect now happens first, unconditionally.
+2. **Watchdog feeds on the wrong task.** `esp_task_wdt_reset()` calls inside the
+   fetch path now run on the unsubscribed network task, where each returns
+   `ESP_ERR_NOT_FOUND` and logs an error — enough serial spam to help corrupt the
+   capture. Removed; loop() not blocking is the protection now.
+3. **Interleaved logging.** Three tasks (loop, network, Wi-Fi events) write to
+   `Serial`, and the old macros made three separate calls per line, so lines
+   shredded each other. `log.h` now formats into one buffer and emits it under a
+   mutex, and the remaining raw `Serial.print` calls were routed through it.
+
+### And a monitoring bug that wasted the most time
+
+Serial captures were badly corrupted, which looked exactly like dropped bytes and
+sent me hunting a hardware fault. The real cause was **accumulated duplicate
+readers**: `pkill -f monitor.sh` reaps the wrapper but orphans the `cat` holding
+the port, and repeated restarts left several readers splitting the same byte
+stream. `tools/monitor.sh` now traps EXIT/INT/TERM to kill its process group and
+refuses to start on top of a stale reader.
+
+Two smaller fixes found along the way: the timestamping pipeline forked `date(1)`
+per line and block-buffered through `tr` (now one line-buffered perl pass), and
+the sanitising regex replaced the **newline itself**, collapsing the log into one
+run-on line.
+
+Verified: flows 13/13, faults 10/10, display harness 24/24, wifitest 9/9.
+
+---
+
+
 ## Decision 2026-08-24: nearest means nearest, ground aircraft included
 
 A 20.8-minute watch showed the display sitting static for 30s+ stretches (worst

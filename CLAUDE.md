@@ -59,6 +59,8 @@ Control Relays (status=ON, exactly one category relay ON)
 
 **Key timing**: 30s fetch interval with exponential backoff on failure. No blocking `delay()` in main loop.
 
+**Threading**: all network I/O runs on `netTaskFn` (core 0, 16 KB stack); `loop()` only requests and collects. Worst `loop()` iteration is ~18 ms even while the network hangs. The net task is deliberately NOT on the task watchdog — a 31s DNS+connect+read is legitimate there — and a wedged job is caught by a stall check in `loop()`. **Rendering and u8g2 must stay on `loop()`** (not thread safe), and anything writing to `Serial` must go through `log.h`, which serialises with a mutex; three tasks log and unguarded writes shred each other's lines.
+
 **Feature flags** (compile-time, overridable in config.h):
 - `FEATURE_OTA` (default 1) — ArduinoOTA updates
 - `FEATURE_TEST_ENDPOINT` (default 1) — Test HTTP server on port 80
