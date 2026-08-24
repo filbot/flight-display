@@ -39,8 +39,9 @@ static char* matchHexToken(char* s, const char* hexLower) {
 // an undersized buffer previously returned false and looked exactly like the
 // aircraft simply not being heard, which hid the bug on device entirely.
 static bool extractLocalRecord(Stream &in, const char* hexLower, char* out, size_t outSize,
-                               bool* truncated = nullptr) {
+                               bool* truncated = nullptr, size_t* bytesRead = nullptr) {
   if (truncated) *truncated = false;
+  size_t consumed = 0;
   // Long enough to hold `"hex"` plus spacing, the colon, quotes and the value,
   // so a token split across a chunk boundary is still matched.
   const size_t nlen = 20;
@@ -55,6 +56,8 @@ static bool extractLocalRecord(Stream &in, const char* hexLower, char* out, size
   while ((millis() - start) < LOCAL_RX_READ_TIMEOUT_MS) {
     int n = in.readBytes(chunk, CH);
     if (n <= 0) break;
+    consumed += (size_t)n;
+    if (bytesRead) *bytesRead = consumed;
     chunk[n] = '\0';
 
     if (!capturing) {

@@ -6,6 +6,52 @@ per finding, newest section first. Status is `open`, `fixed`, or `wontfix`.
 
 ---
 
+## 2026-08-24: "distance and altitude don't change often enough" — validated
+
+Filip reported intermittent freezes. The update path itself is **correct**:
+compared against the receiver's live truth over 18 samples, the device tracked
+distance with **0.00 km error** and updated twice per 8s, exactly the 4s interval.
+Nothing wrong with extraction, the network, the render guard or the arithmetic.
+
+The freezes came entirely from attempts that produced no update, and those had
+been collapsed into one `local_miss` counter that made a working path look
+broken. Split into four:
+
+| bucket | meaning |
+|---|---|
+| `local_miss` | record genuinely not in the feed |
+| `local_nopos` | aircraft heard, but with **no position at all** |
+| `local_stale` | position older than `LOCAL_RX_MAX_AGE_S` |
+| `local_skip` | not attempted (distance gate or give-up counter) |
+
+Measured: `ok 51, notfound 0, nopos 0, stale 8` — **staleness was the only
+cause**, at 14%. Extraction was flawless, confirmed independently by the host
+test at 56/56 records against a real 23 KB payload.
+
+### Fix
+
+`LOCAL_RX_MAX_AGE_S` 15s -> 30s. The threshold was being judged in the abstract
+rather than against what it competes with: the alternative to a 16s-old local
+position is an API value up to `FETCH_INTERVAL_MS` (30s) old, so discarding the
+fresher number to keep the staler one is backwards.
+
+Result over 5 minutes: **74 ok, 0 notfound, 0 nopos, 0 stale — 100% of attempts
+produce a live update**, against 86% before.
+
+### Caveats worth keeping
+
+- `local_nopos` cannot be fixed by any threshold: dump1090 lists aircraft it
+  hears without ever resolving a position. One sample showed 21 of 69 attempts in
+  that bucket, so the miss profile swings a lot with which aircraft is on screen.
+- These counters are meaningless during test runs — mock hexes are never in the
+  receiver. Only read them against the live API.
+- An earlier hypothesis that extraction was truncating on large bodies was
+  **wrong**: the byte-scanned diagnostic added to chase it never logged a single
+  line, which is what proved the misses were rejections rather than short reads.
+
+---
+
+
 ## 2026-08-24 15:05 UTC: "No aircraft nearby" investigated — the display was wrong
 
 Filip saw the splash briefly. Health data pins it to **15:05:30 -> 15:06:34**

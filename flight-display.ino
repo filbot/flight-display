@@ -431,8 +431,15 @@ static volatile bool g_inOta = false;  // set during OTA to pause app work
 #define LOCAL_RX_MISS_GIVEUP 3
 #endif
 
+// A local record older than this is ignored. The right comparison is not "is it
+// fresh in the abstract" but "is it fresher than what it would replace": the
+// alternative is API data up to FETCH_INTERVAL_MS (30s) old, so rejecting a
+// 16s-old local position to keep a possibly 30s-old API one is backwards.
+// Measured at 15s, staleness was the single largest cause of missed live
+// updates. Aircraft heard with NO position are a separate bucket this cannot
+// help — see local_nopos.
 #ifndef LOCAL_RX_MAX_AGE_S
-#define LOCAL_RX_MAX_AGE_S 15
+#define LOCAL_RX_MAX_AGE_S 30
 #endif
 #ifndef LOCAL_RX_CONNECT_TIMEOUT_MS
 #define LOCAL_RX_CONNECT_TIMEOUT_MS 2000
@@ -467,6 +474,7 @@ static uint32_t g_localMsLast = 0, g_localMsMax = 0;
 static uint32_t g_nextLocalAt = 0;
 static uint32_t g_statLocalOk = 0, g_statLocalMiss = 0, g_statLocalFail = 0;
 static uint32_t g_statLocalSkip = 0;
+static uint32_t g_statLocalNoPos = 0, g_statLocalStale = 0;
 static float g_localSeenPos = -1.0f;
 static char g_localMissHex[8] = "";
 static uint8_t g_localMissRun = 0;
@@ -520,6 +528,8 @@ static void httpHandleHealth() {
   d["local_miss"] = g_statLocalMiss;
   d["local_fail"] = g_statLocalFail;
   d["local_skip"] = g_statLocalSkip;
+  d["local_nopos"] = g_statLocalNoPos;
+  d["local_stale"] = g_statLocalStale;
   d["last_ac_returned"] = g_lastAcReturned;
   d["last_ac_rejected"] = g_lastAcRejected;
   d["local_seen_pos"] = g_localSeenPos;
@@ -554,6 +564,7 @@ static void httpHandleHealth() {
     resolveFriendlyName(g_lastShown, title, sizeof(title));
     d["title"] = title;
   }
+  d["hex"] = (const char*)g_lastShown.hex;
   d["ident"] = (const char*)g_lastShown.ident;
   d["type"] = (const char*)g_lastShown.typeCode;
   d["op"] = (const char*)g_lastShown.opClass;
@@ -1366,6 +1377,7 @@ static void refreshFromLocalReceiver() {
     return;
   }
   int code = http.GET();
+  int contentLen = http.getSize();
   if (code != HTTP_CODE_OK) {
     http.end();
     g_statLocalFail++;
@@ -1384,7 +1396,8 @@ static void refreshFromLocalReceiver() {
   char record[768];
   bool truncated = false;
   PatientStream body(client, LOCAL_RX_READ_TIMEOUT_MS);
-  bool found = extractLocalRecord(body, hexLower, record, sizeof(record), &truncated);
+  size_t scanned = 0;
+  bool found = extractLocalRecord(body, hexLower, record, sizeof(record), &truncated, &scanned);
   http.end();
   g_localMsLast = millis() - localStart;
   if (g_localMsLast > g_localMsMax) g_localMsMax = g_localMsLast;
@@ -1395,6 +1408,10 @@ static void refreshFromLocalReceiver() {
     return;
   }
   if (!found) {
+    // Whether we saw the WHOLE body matters: a short read means the aircraft
+    // may well be present and simply beyond where we stopped reading.
+    LOG_WARN("Local miss for %s after %u of %d bytes", hexLower,
+             (unsigned)scanned, (int)contentLen);
     g_statLocalMiss++;
     if (strcasecmp(g_localMissHex, g_lastShown.hex) != 0) {
       strncpy(g_localMissHex, g_lastShown.hex, sizeof(g_localMissHex) - 1);
@@ -1414,10 +1431,19 @@ static void refreshFromLocalReceiver() {
   }
   JsonObject a = doc.as<JsonObject>();
 
-  // Only trust a position the receiver heard recently.
-  if (a["seen_pos"].isNull() || a["lat"].isNull() || a["lon"].isNull()) { g_statLocalMiss++; return; }
+  // Only trust a position the receiver heard recently. These two cases are very
+  // different from "the record is not there" and were previously all lumped
+  // into one counter, which made a working path look broken.
+  if (a["seen_pos"].isNull() || a["lat"].isNull() || a["lon"].isNull()) {
+    g_statLocalNoPos++;
+    return;
+  }
   float age = a["seen_pos"].as<float>();
-  if (age > LOCAL_RX_MAX_AGE_S) { g_statLocalMiss++; return; }
+  if (age > LOCAL_RX_MAX_AGE_S) {
+    g_statLocalStale++;
+    g_localSeenPos = age;
+    return;
+  }
 
   FlightInfo upd = g_lastShown;  // identity and classification untouched
   upd.lat = a["lat"].as<double>();
